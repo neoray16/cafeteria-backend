@@ -159,6 +159,16 @@ const OTP_MAX_ATTEMPTS = 5;         // כמה ניסיונות שגויים מו
 const OTP_RESEND_SECONDS = 60;      // זמן המתנה מינימלי בין שליחות
 const OTP_MAX_PER_HOUR = 5;         // מקסימום קודים לתלמיד בשעה
 
+// מצב פיילוט: אם משתנה הסביבה PILOT_FIXED_CODE מוגדר (6 ספרות, למשל 111111),
+// כל התלמידים נכנסים עם הקוד הקבוע הזה ולא נשלח SMS.
+// כדי לחזור לקודים אמיתיים - פשוט מוחקים את המשתנה (ב-Render: Environment) ולא צריך לשנות קוד.
+const PILOT_FIXED_CODE = /^\d{6}$/.test(process.env.PILOT_FIXED_CODE || '')
+    ? process.env.PILOT_FIXED_CODE
+    : null;
+if (PILOT_FIXED_CODE) {
+    console.warn('PILOT MODE: fixed student login code is active - anyone who knows a student name + phone can log in as them');
+}
+
 const STUDENT_TOKEN_TTL = '30d';
 const MANAGER_TOKEN_TTL = '12h';
 
@@ -382,7 +392,8 @@ app.post('/api/students/login/request-code', authLimiter, async (req, res) => {
         }
 
         // יצירת קוד אקראי של 6 ספרות (100000-999999)
-        const code = crypto.randomInt(100000, 1000000).toString();
+        // (במצב פיילוט - הקוד הקבוע)
+        const code = PILOT_FIXED_CODE || crypto.randomInt(100000, 1000000).toString();
 
         // ביטול קודים קודמים שעוד לא נוצלו, ושמירת הקוד החדש
         await pool.query(
@@ -395,7 +406,9 @@ app.post('/api/students/login/request-code', authLimiter, async (req, res) => {
             [student.id, hashCode(code), OTP_TTL_MINUTES]
         );
 
-        await sendSms(student.phone, `קוד הכניסה שלך ל-siXeven: ${code}\nהקוד תקף ל-${OTP_TTL_MINUTES} דקות.`);
+        if (!PILOT_FIXED_CODE) {
+            await sendSms(student.phone, `קוד הכניסה שלך ל-siXeven: ${code}\nהקוד תקף ל-${OTP_TTL_MINUTES} דקות.`);
+        }
 
         res.status(200).json({
             status: 'success',
