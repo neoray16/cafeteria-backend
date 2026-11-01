@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="robots" content="noindex, nofollow">
+    <title>siXeven - אדמין</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Rubik:wght@300;400;600;700;900&display=swap');
+        body { font-family: 'Rubik', sans-serif; }
+        .spinner { border: 2px solid rgba(255,255,255,.25); border-top-color: #fff; border-radius: 50%; width: 14px; height: 14px; animation: spin .7s linear infinite; display: inline-block; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        :focus-visible { outline: 2px solid #818cf8; outline-offset: 2px; border-radius: 4px; }
+    </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen">
+
+<!-- ============ כניסה ============ -->
+<div id="login-screen" class="min-h-screen flex items-center justify-center p-4">
+    <div class="w-full max-w-sm bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4 shadow-2xl">
+        <div class="text-center">
+            <div class="w-12 h-12 mx-auto mb-3 rounded-xl bg-indigo-600 flex items-center justify-center text-xl"><i class="fa-solid fa-shield-halved"></i></div>
+            <h1 class="text-xl font-black">siXeven אדמין</h1>
+            <p class="text-xs text-slate-500 mt-1">גישה לבעל האפליקציה בלבד</p>
+        </div>
+        <input id="admin-password" type="password" autocomplete="current-password" placeholder="סיסמת אדמין"
+               onkeydown="if(event.key==='Enter')adminLogin()"
+               class="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-sm focus:outline-none focus:border-indigo-500">
+        <p id="login-error" class="text-rose-400 text-xs text-center min-h-4"></p>
+        <button id="login-btn" onclick="adminLogin()" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-3 rounded-xl text-sm">כניסה</button>
+    </div>
+</div>
+
+<!-- ============ האדמין ============ -->
+<div id="admin-screen" class="hidden max-w-5xl mx-auto p-4 pb-16">
+    <header class="flex items-center justify-between py-3">
+        <h1 class="text-lg font-black"><i class="fa-solid fa-shield-halved text-indigo-400 ml-2"></i>siXeven אדמין</h1>
+        <button onclick="adminLogout()" class="text-xs text-slate-400 hover:text-white border border-slate-800 rounded-lg px-3 py-1.5"><i class="fa-solid fa-arrow-right-from-bracket ml-1"></i>יציאה</button>
+    </header>
+
+    <nav class="flex gap-1.5 bg-slate-900 p-1 rounded-xl border border-slate-800 text-sm mb-4">
+        <button id="tab-overview" onclick="setTab('overview')" class="flex-1 py-2 rounded-lg font-bold">סקירה</button>
+        <button id="tab-orders" onclick="setTab('orders')" class="flex-1 py-2 rounded-lg font-bold">הזמנות</button>
+        <button id="tab-cafeterias" onclick="setTab('cafeterias')" class="flex-1 py-2 rounded-lg font-bold">קפיטריות</button>
+    </nav>
+
+    <div id="period-bar" class="flex gap-1.5 mb-4 text-xs">
+        <button data-period="today" onclick="setPeriod('today')" class="px-3 py-1.5 rounded-full border"></button>
+        <button data-period="7d" onclick="setPeriod('7d')" class="px-3 py-1.5 rounded-full border"></button>
+        <button data-period="30d" onclick="setPeriod('30d')" class="px-3 py-1.5 rounded-full border"></button>
+        <button data-period="all" onclick="setPeriod('all')" class="px-3 py-1.5 rounded-full border"></button>
+        <button onclick="refresh()" class="mr-auto px-3 py-1.5 rounded-full border border-slate-700 text-slate-300"><i class="fa-solid fa-rotate ml-1"></i>רענן</button>
+    </div>
+
+    <main id="content"></main>
+</div>
+
+<div id="toast" class="fixed top-4 left-1/2 -translate-x-1/2 z-50 hidden px-4 py-2 rounded-xl text-sm font-bold shadow-xl"></div>
+
+<script>
+    const API = location.origin + '/api';
+    const PERIOD_LABEL = { today: 'היום', '7d': '7 ימים', '30d': '30 יום', all: 'הכל' };
+    const STATUS_LABEL = { pending: 'בהכנה', ready: 'מוכנה', cancelled: 'בוטלה' };
+    const STATUS_CLS = {
+        pending: 'bg-amber-950/60 text-amber-300 border-amber-600/40',
+        ready: 'bg-emerald-950/60 text-emerald-300 border-emerald-600/40',
+        cancelled: 'bg-slate-800 text-slate-400 border-slate-700'
+    };
+
+    let token = null;
+    try { token = sessionStorage.getItem('sixeven_admin_token'); } catch (e) {}
+    let tab = 'overview';
+    let period = 'today';
+    let ordersFilter = { cafeteriaId: '', status: '', payment: '' };
+    let overview = null;
+
+    const $ = (id) => document.getElementById(id);
+    const esc = (v) => { const d = document.createElement('div'); d.textContent = v == null ? '' : String(v); return d.innerHTML; };
+    const money = (n) => '₪' + Number(n || 0).toLocaleString('he-IL', { minimumFractionDigits: 0, maximumFractionDigits: 2 });
+
+    function toast(msg, error) {
+        const t = $('toast');
+        t.className = 'fixed top-4 left-1/2 -translate-x-1/2 z-50 px-4 py-2 rounded-xl text-sm font-bold shadow-xl ' + (error ? 'bg-rose-600' : 'bg-emerald-600');
+        t.textContent = msg;
+        clearTimeout(toast.t);
+        toast.t = setTimeout(() => t.classList.add('hidden'), 3000);
+    }
+
+    async function api(path, opts = {}) {
+        const res = await fetch(API + path, {
+            ...opts,
+            headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) }
+        });
+        let data = null;
+        try { data = await res.json(); } catch (e) {}
+        if (res.status === 401 && token) { adminLogout(); toast('פג תוקף ההתחברות, יש להיכנס שוב', true); throw new Error('expired'); }
+        if (!res.ok) throw new Error((data && data.message) || ('שגיאה ' + res.status));
+        return data;
+    }
+
+    const SERVER_MSG = {
+        'Invalid login details': 'הסיסמה שגויה',
+        'Admin is not configured': 'האדמין לא מוגדר בשרת (חסר ADMIN_PASSWORD_HASH)',
+        'A cafeteria with this name already exists': 'כבר קיימת קפיטריה בשם הזה',
+        'Cafeteria name is required (2+ characters)': 'נא להזין שם קפיטריה (לפחות 2 תווים)',
+        'A valid email is required': 'נא להזין אימייל תקין',
+        'Password must be at least 8 characters': 'הסיסמה חייבת להכיל לפחות 8 תווים'
+    };
+    const he = (m) => SERVER_MSG[m] || (/Too many/.test(m) ? 'יותר מדי ניסיונות. נסה שוב בעוד כמה דקות' : m);
+
+    // ---------- כניסה / יציאה ----------
+    async function adminLogin() {
+        const btn = $('login-btn'), err = $('login-error');
+        err.textContent = '';
+        const password = $('admin-password').value;
+        if (!password) { err.textContent = 'נא להזין סיסמה'; return; }
+        btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+        try {
+            const r = await api('/admin/login', { method: 'POST', body: JSON.stringify({ password }) });
+            token = r.token;
+            try { sessionStorage.setItem('sixeven_admin_token', token); } catch (e) {}
+            $('admin-password').value = '';
+            showAdmin();
+        } catch (e) { err.textContent = he(e.message); }
+        btn.disabled = false; btn.textContent = 'כניסה';
+    }
+    function adminLogout() {
+        token = null;
+        try { sessionStorage.removeItem('sixeven_admin_token'); } catch (e) {}
+        $('admin-screen').classList.add('hidden');
+        $('login-screen').classList.remove('hidden');
+    }
+    function showAdmin() {
+        $('login-screen').classList.add('hidden');
+        $('admin-screen').classList.remove('hidden');
+        setTab('overview');
+    }
+
+    // ---------- ניווט ----------
+    function setTab(t) {
+        tab = t;
+        for (const k of ['overview', 'orders', 'cafeterias']) {
+            $('tab-' + k).className = 'flex-1 py-2 rounded-lg font-bold ' + (k === t ? 'bg-indigo-600 text-white' : 'text-slate-400');
+        }
+        $('period-bar').classList.toggle('hidden', t === 'cafeterias');
+        paintPeriod();
+        refresh();
+    }
+    function setPeriod(p) { period = p; paintPeriod(); refresh(); }
+    function paintPeriod() {
+        document.querySelectorAll('[data-period]').forEach(b => {
+            const p = b.dataset.period;
+            b.textContent = PERIOD_LABEL[p];
+            b.className = 'px-3 py-1.5 rounded-full border ' + (p === period ? 'bg-indigo-600 border-indigo-500 text-white' : 'border-slate-700 text-slate-300');
+        });
+    }
+    function loading() { $('content').innerHTML = '<div class="text-center py-16 text-slate-500"><span class="spinner"></span></div>'; }
+
+    async function refresh() {
+        loading();
+        try {
+            if (tab === 'overview') { overview = await api('/admin/overview?period=' + period); renderOverview(); }
+            else if (tab === 'cafeterias') { overview = await api('/admin/overview?period=all'); renderCafeterias(); }
+            else { await renderOrders(); }
+        } catch (e) {
+            if (e.message !== 'expired') $('content').innerHTML = `<p class="text-center text-rose-400 text-sm py-10">${esc(e.message)}</p>`;
+        }
+    }
+
+    // ---------- סקירה ----------
+    function statCard(icon, label, value, cls) {
+        return `<div class="bg-slate-900 border border-slate-800 rounded-2xl p-4">
+            <p class="text-[11px] text-slate-500 mb-1"><i class="fa-solid ${icon} ml-1"></i>${label}</p>
+            <p class="text-2xl font-black ${cls || 'text-white'}">${value}</p></div>`;
+    }
+    function renderOverview() {
+        const t = overview.totals, list = overview.cafeterias;
+        const maxRev = Math.max(1, ...list.map(c => c.revenue));
+        $('content').innerHTML = `
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-5">
+                ${statCard('fa-receipt', 'הזמנות', t.orders)}
+                ${statCard('fa-sack-dollar', 'הכנסות', money(t.revenue), 'text-emerald-400')}
+                ${statCard('fa-hourglass-half', 'ממתינות כעת', t.pending, 'text-amber-300')}
+                ${statCard('fa-users', 'תלמידים רשומים', t.students)}
+            </div>
+            <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4 mb-5">
+                <p class="text-xs text-slate-400 font-bold mb-2">אמצעי תשלום (${PERIOD_LABEL[period]})</p>
+                ${payBar(t.wallet_total, t.cash_total)}
+            </div>
+            <h2 class="text-sm font-bold mb-2">לפי קפיטריה</h2>
+            <div class="space-y-3">${list.length === 0 ? '<p class="text-slate-500 text-sm text-center py-8">עדיין אין קפיטריות</p>' : list.map(c => `
+                <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4">
+                    <div class="flex items-center justify-between mb-2">
+                        <div class="flex items-center gap-2">
+                            <span class="font-bold">${esc(c.name)}</span>
+                            ${c.is_open ? '<span class="text-[11px] text-emerald-300 bg-emerald-950/60 border border-emerald-600/40 rounded-full px-2">פתוחה</span>' : '<span class="text-[11px] text-slate-400 bg-slate-800 border border-slate-700 rounded-full px-2">סגורה</span>'}
+                        </div>
+                        <span class="font-black text-emerald-400">${money(c.revenue)}</span>
+                    </div>
+                    <div class="h-2 bg-slate-800 rounded-full overflow-hidden mb-2"><div class="h-full bg-gradient-to-l from-indigo-500 to-emerald-500 rounded-full" style="width:${Math.round(c.revenue / maxRev * 100)}%"></div></div>
+                    <div class="flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-slate-400">
+                        <span>${c.orders} הזמנות</span><span>${c.pending} ממתינות</span><span>${c.cancelled} בוטלו</span>
+                        <span>${c.students} תלמידים</span><span>ארנק ${money(c.wallet_total)}</span><span>מזומן ${money(c.cash_total)}</span>
+                    </div>
+                </div>`).join('')}</div>`;
+    }
+    function payBar(wallet, cash) {
+        const total = wallet + cash;
+        if (total <= 0) return '<p class="text-xs text-slate-500">אין נתונים בתקופה הזו</p>';
+        const w = Math.round(wallet / total * 100);
+        return `<div class="flex h-3 rounded-full overflow-hidden bg-slate-800"><div class="bg-sky-500" style="width:${w}%"></div><div class="bg-amber-400" style="width:${100 - w}%"></div></div>
+            <div class="flex justify-between text-[11px] mt-2"><span class="text-sky-300"><i class="fa-solid fa-wallet ml-1"></i>ארנק ${money(wallet)} (${w}%)</span><span class="text-amber-300"><i class="fa-solid fa-money-bill-wave ml-1"></i>מזומן ${money(cash)} (${100 - w}%)</span></div>`;
+    }
+
+    // ---------- הזמנות ----------
+    function sel(id, value, options) {
+        return `<select id="${id}" onchange="onFilter()" class="bg-slate-900 border border-slate-800 rounded-lg px-2 py-1.5 text-xs">${options.map(([v, l]) => `<option value="${esc(v)}" ${String(v) === String(value) ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>`;
+    }
+    function onFilter() {
+        ordersFilter = { cafeteriaId: $('f-caf').value, status: $('f-status').value, payment: $('f-pay').value };
+        refresh();
+    }
+    async function renderOrders() {
+        if (!overview) overview = await api('/admin/overview?period=all');
+        const qs = new URLSearchParams({ period });
+        for (const [k, v] of Object.entries(ordersFilter)) if (v) qs.set(k, v);
+        const r = await api('/admin/orders?' + qs);
+        const filters = `<div class="flex flex-wrap gap-2 mb-4">
+            ${sel('f-caf', ordersFilter.cafeteriaId, [['', 'כל הקפיטריות'], ...overview.cafeterias.map(c => [c.id, c.name])])}
+            ${sel('f-status', ordersFilter.status, [['', 'כל הסטטוסים'], ['pending', 'בהכנה'], ['ready', 'מוכנה'], ['cancelled', 'בוטלה']])}
+            ${sel('f-pay', ordersFilter.payment, [['', 'כל אמצעי התשלום'], ['wallet', 'ארנק'], ['cash', 'מזומן']])}
+            <span class="text-xs text-slate-500 self-center">${r.count} הזמנות${r.count >= 300 ? ' (מוצגות 300 אחרונות)' : ''}</span></div>`;
+        const live = r.orders.filter(o => o.status !== 'cancelled');
+        const sum = live.reduce((a, o) => a + Number(o.total_price), 0);
+        $('content').innerHTML = filters + (r.orders.length === 0 ? '<p class="text-slate-500 text-sm text-center py-12">אין הזמנות לפי הסינון</p>' : `
+            <p class="text-xs text-slate-400 mb-3">סה"כ (בלי מבוטלות): <b class="text-emerald-400">${money(sum)}</b></p>
+            <div class="grid md:grid-cols-2 gap-3">${r.orders.map(o => `
+                <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4 ${o.status === 'cancelled' ? 'opacity-60' : ''}">
+                    <div class="flex items-start justify-between mb-1">
+                        <div><p class="font-bold text-sm">#${esc(o.id)} · ${esc(o.student_name)}</p>
+                        <p class="text-[11px] text-slate-500"><span dir="ltr">${esc(o.student_phone)}</span> · ${new Date(o.created_at).toLocaleString('he-IL')}</p></div>
+                        <span class="text-[11px] font-bold border rounded-full px-2 py-0.5 ${o.status === 'ready' && o.picked_up_at ? 'bg-sky-950/60 text-sky-300 border-sky-600/40' : (STATUS_CLS[o.status] || '')}">${o.status === 'ready' && o.picked_up_at ? 'נאספה' : (STATUS_LABEL[o.status] || esc(o.status))}</span>
+                    </div>
+                    <p class="text-[11px] text-indigo-300 mb-2"><i class="fa-solid fa-store ml-1"></i>${esc(o.cafeteria_name)}</p>
+                    <ul class="text-xs text-slate-300 mb-2">${(o.items || []).map(i => `<li>${esc(i.product_name)} <span class="text-slate-500">x${i.quantity}</span>${i.item_notes ? ` <span class="text-amber-300/80">(${esc(i.item_notes)})</span>` : ''}</li>`).join('')}</ul>
+                    ${o.notes ? `<p class="text-xs text-amber-300/90 mb-2"><i class="fa-solid fa-note-sticky ml-1"></i>${esc(o.notes)}</p>` : ''}
+                    ${o.picked_up_at ? `<p class="text-[11px] text-sky-300 mb-2"><i class="fa-solid fa-bag-shopping ml-1"></i>נאספה ב-${new Date(o.picked_up_at).toLocaleString('he-IL', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' })}</p>` : ''}
+                    <div class="flex items-center justify-between">
+                        <span class="font-black ${o.status === 'cancelled' ? 'text-slate-500 line-through' : 'text-emerald-400'}">${money(o.total_price)}</span>
+                        ${o.payment_method === 'cash'
+                            ? '<span class="text-[11px] font-bold text-amber-300 bg-amber-950/60 border border-amber-600/40 rounded-full px-2 py-0.5"><i class="fa-solid fa-money-bill-wave ml-1"></i>מזומן</span>'
+                            : '<span class="text-[11px] font-bold text-sky-300 bg-sky-950/60 border border-sky-600/40 rounded-full px-2 py-0.5"><i class="fa-solid fa-wallet ml-1"></i>ארנק</span>'}
+                    </div>
+                </div>`).join('')}</div>`);
+    }
+
+    // ---------- קפיטריות ----------
+    function renderCafeterias() {
+        const list = overview.cafeterias;
+        $('content').innerHTML = `
+            <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-3 mb-5">
+                <h2 class="text-sm font-bold">קפיטריה חדשה</h2>
+                <input id="nc-name" maxlength="100" placeholder="שם הקפיטריה (כך התלמידים בוחרים אותה בהרשמה)" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-sm focus:outline-none focus:border-indigo-500">
+                <input id="nc-email" type="email" dir="ltr" maxlength="200" placeholder="אימייל המנהל (לכניסה)" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-sm text-left focus:outline-none focus:border-indigo-500">
+                <div class="flex gap-2">
+                    <input id="nc-pass" type="text" dir="ltr" autocomplete="off" placeholder="סיסמה (8 תווים ומעלה)" class="flex-1 bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-sm text-left focus:outline-none focus:border-indigo-500">
+                    <button type="button" onclick="$('nc-pass').value = genPassword()" class="border border-slate-700 text-slate-300 text-xs font-bold px-3 rounded-xl">צור סיסמה</button>
+                </div>
+                <p class="text-[11px] text-slate-500">הסיסמה נשמרת מוצפנת ולא ניתן לראות אותה שוב. שמור אותה ומסור למנהל.</p>
+                <p id="nc-msg" class="text-xs min-h-4 text-center"></p>
+                <button id="nc-btn" onclick="createCafeteria()" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-2.5 rounded-xl text-sm">צור קפיטריה</button>
+            </div>
+            <h2 class="text-sm font-bold mb-2">קפיטריות קיימות (${list.length})</h2>
+            <div class="space-y-2">${list.map(c => `
+                <div class="bg-slate-900 border border-slate-800 rounded-xl p-3 flex items-center justify-between gap-2">
+                    <div class="min-w-0"><p class="font-bold text-sm truncate">${esc(c.name)}</p>
+                    <p class="text-[11px] text-slate-500 truncate" dir="ltr">${esc(c.email)}</p>
+                    <p class="text-[11px] text-slate-500">${c.students} תלמידים</p></div>
+                    <button onclick="resetPassword(${c.id})" class="shrink-0 text-xs border border-slate-700 text-slate-300 hover:bg-slate-800 rounded-lg px-3 py-1.5"><i class="fa-solid fa-key ml-1"></i>איפוס סיסמה</button>
+                </div>`).join('')}</div>`;
+    }
+    function genPassword() {
+        const chars = 'abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789';
+        const a = new Uint32Array(12); crypto.getRandomValues(a);
+        return Array.from(a, n => chars[n % chars.length]).join('');
+    }
+    async function createCafeteria() {
+        const msg = $('nc-msg'), btn = $('nc-btn');
+        msg.className = 'text-xs min-h-4 text-center text-rose-400'; msg.textContent = '';
+        const body = { name: $('nc-name').value.trim(), email: $('nc-email').value.trim(), password: $('nc-pass').value };
+        btn.disabled = true;
+        try {
+            const r = await api('/admin/cafeterias', { method: 'POST', body: JSON.stringify(body) });
+            toast('הקפיטריה "' + r.cafeteria.name + '" נוצרה');
+            alert('הקפיטריה נוצרה. פרטי כניסה למנהל:\n\nקפיטריה: ' + r.cafeteria.name + '\nאימייל: ' + r.cafeteria.email + '\nסיסמה: ' + body.password + '\n\nהסיסמה לא תוצג שוב.');
+            refresh();
+        } catch (e) { msg.textContent = he(e.message); btn.disabled = false; }
+    }
+    async function resetPassword(id) {
+        const c = overview.cafeterias.find(x => x.id === id); const name = c ? c.name : '';
+        const p = genPassword();
+        if (!confirm('לאפס את הסיסמה של "' + name + '"? תיווצר סיסמה חדשה והישנה תפסיק לעבוד.')) return;
+        try {
+            await api('/admin/cafeterias/' + id + '/password', { method: 'PUT', body: JSON.stringify({ password: p }) });
+            alert('הסיסמה החדשה של "' + name + '":\n\n' + p + '\n\nהיא לא תוצג שוב.');
+        } catch (e) { toast(he(e.message), true); }
+    }
+
+    if (token) showAdmin();
+</script>
+</body>
+</html>

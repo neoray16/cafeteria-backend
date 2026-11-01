@@ -30,6 +30,23 @@ if (IS_PRODUCTION) {
 }
 
 // ==========================================
+// דף האדמין - מוגש מהשרת בכתובת /admin (הקובץ admin.html צריך לשבת ליד server.js)
+// מוגש לפני helmet כי הדף משתמש בספריות מ-CDN. הכניסה אליו מוגנת בסיסמה (ראה /api/admin/login)
+// ==========================================
+app.get('/admin', (req, res) => {
+    res.set({
+        'Cache-Control': 'no-store',
+        'X-Frame-Options': 'DENY',
+        'X-Content-Type-Options': 'nosniff',
+        'X-Robots-Tag': 'noindex, nofollow',
+        'Referrer-Policy': 'no-referrer'
+    });
+    res.sendFile(path.join(__dirname, 'admin.html'), (err) => {
+        if (err && !res.headersSent) res.status(404).end();
+    });
+});
+
+// ==========================================
 // Middlewares של אבטחה
 // ==========================================
 
@@ -49,14 +66,15 @@ if (IS_PRODUCTION && allowedOrigins.length === 0) {
     console.warn('ALLOWED_ORIGINS is empty - browser requests from any website will be blocked');
 }
 
-app.use(cors({
+app.use((req, res, next) => cors({
     origin: (origin, callback) => {
         if (!origin) return callback(null, true);                    // אפליקציה / Postman
+        if (origin === `${req.protocol}://${req.get('host')}`) return callback(null, true); // דף האדמין שמוגש מהשרת עצמו
         if (!IS_PRODUCTION && allowedOrigins.length === 0) return callback(null, true); // פיתוח מקומי
         if (allowedOrigins.includes(origin)) return callback(null, true);
         return callback(new Error('Not allowed by CORS'));
     }
-}));
+})(req, res, next));
 
 // הגבלת גודל גוף הבקשה
 app.use(express.json({ limit: '100kb' }));
@@ -204,6 +222,50 @@ function safeEqual(a, b) {
 }
 
 // ==========================================
+// שעות פתיחה אוטומטיות
+// עמודות: auto_schedule (האם הפתיחה אוטומטית) ו-schedule (JSON לפי יום, 0=ראשון עד 6=שבת)
+//   { "0": { "enabled": true, "open": "07:30", "close": "14:00" }, ... }
+// במצב אוטומטי הקפיטריה פתוחה רק ביום מופעל ובין שעת הפתיחה לשעת הסגירה (שעון ישראל).
+// במצב ידני (auto_schedule = FALSE) נשארת הפתיחה/נעילה הידנית (is_open) כמו קודם.
+// ==========================================
+const DAY_INDEX = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
+const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+
+function israelNow() {
+    const parts = new Intl.DateTimeFormat('en-GB', {
+        timeZone: 'Asia/Jerusalem', weekday: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
+    }).formatToParts(new Date());
+    const get = (t) => parts.find(p => p.type === t).value;
+    return { day: DAY_INDEX[get('weekday')], time: `${get('hour')}:${get('minute')}` };
+}
+
+function isCafeteriaOpenNow(row) {
+    if (!row) return false;
+    if (!row.auto_schedule) return !!row.is_open;
+    const schedule = row.schedule || {};
+    const { day, time } = israelNow();
+    const d = schedule[String(day)];
+    return !!(d && d.enabled && TIME_RE.test(d.open) && TIME_RE.test(d.close) && time >= d.open && time < d.close);
+}
+
+function validateSchedule(input) {
+    if (!input || typeof input !== 'object') return null;
+    const out = {};
+    for (let i = 0; i < 7; i++) {
+        const d = input[String(i)];
+        if (!d || typeof d !== 'object') return null;
+        const enabled = d.enabled === true;
+        if (enabled && (!TIME_RE.test(d.open) || !TIME_RE.test(d.close) || d.open >= d.close)) return null;
+        out[String(i)] = {
+            enabled,
+            open: TIME_RE.test(d.open) ? d.open : '07:30',
+            close: TIME_RE.test(d.close) ? d.close : '14:00'
+        };
+    }
+    return out;
+}
+
+// ==========================================
 // בדיקת התחברות
 // הלקוח שולח: Authorization: Bearer <token>
 // ==========================================
@@ -266,6 +328,16 @@ app.post('/api/students/register', authLimiter, async (req, res) => {
         });
     }
 
+    // חובה לאשר את תנאי השימוש. הדיוור השיווקי הוא רשות ונשמר רק אם סומן במפורש
+    if (req.body.acceptedTerms !== true) {
+        return res.status(400).json({
+            status: 'error',
+            message: 'You must accept the terms of use'
+        });
+    }
+    const termsVersion = cleanText(req.body.termsVersion, 20);
+    const marketingConsent = req.body.marketingConsent === true;
+
     if (!isValidPhone(phone)) {
         return res.status(400).json({
             status: 'error',
@@ -302,10 +374,10 @@ app.post('/api/students/register', authLimiter, async (req, res) => {
         }
 
         const result = await pool.query(
-            `INSERT INTO students (name, phone, cafeteria_id)
-             VALUES ($1, $2, $3)
+            `INSERT INTO students (name, phone, cafeteria_id, terms_accepted_at, terms_version, marketing_consent, marketing_consent_at)
+             VALUES ($1, $2, $3, NOW(), $4, $5, CASE WHEN $5 THEN NOW() ELSE NULL END)
              RETURNING id, name, phone, cafeteria_id`,
-            [name, phone, cafeteria_id]
+            [name, phone, cafeteria_id, termsVersion, marketingConsent]
         );
 
         res.status(201).json({
@@ -533,7 +605,7 @@ app.post('/api/students/login/verify-code', authLimiter, async (req, res) => {
 app.get('/api/students/me', requireStudent, async (req, res) => {
     try {
         const result = await pool.query(
-            `SELECT s.id, s.name, s.phone, s.cafeteria_id, COALESCE(s.balance, 0) AS balance, c.name AS cafeteria_name
+            `SELECT s.id, s.name, s.phone, s.cafeteria_id, COALESCE(s.balance, 0) AS balance, COALESCE(s.marketing_consent, FALSE) AS marketing_consent, c.name AS cafeteria_name
              FROM students s
              JOIN cafeterias c ON c.id = s.cafeteria_id
              WHERE s.id = $1`,
@@ -549,6 +621,305 @@ app.get('/api/students/me', requireStudent, async (req, res) => {
     } catch (err) {
         console.error('Error fetching student:', err);
         res.status(500).json({ status: 'error', message: 'Server error while fetching student' });
+    }
+});
+
+// ==========================================
+// ביטול / חידוש הסכמה לדיוור שיווקי (התלמיד המחובר)
+// ==========================================
+app.put('/api/students/marketing', requireStudent, async (req, res) => {
+    if (typeof req.body.marketingConsent !== 'boolean') {
+        return res.status(400).json({ status: 'error', message: 'marketingConsent must be true or false' });
+    }
+    try {
+        const result = await pool.query(
+            `UPDATE students SET marketing_consent = $1, marketing_consent_at = NOW()
+             WHERE id = $2 RETURNING marketing_consent`,
+            [req.body.marketingConsent, req.student.studentId]
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ status: 'error', message: 'Student not found' });
+        }
+        res.status(200).json({ status: 'success', marketing_consent: result.rows[0].marketing_consent });
+    } catch (err) {
+        console.error('Error updating marketing consent:', err);
+        res.status(500).json({ status: 'error', message: 'Server error while updating consent' });
+    }
+});
+
+// ==========================================
+// טעינת ארנק לתלמיד לפי מספר טלפון - מנהל קפיטריה מחובר בלבד
+// GET  /api/cafeteria/students/lookup?phone=05XXXXXXXX  -> שם התלמיד (לאימות לפני טעינה)
+// POST /api/cafeteria/topup  { phone, amount }
+// אפשר לטעון רק לתלמיד ששייך לקפיטריה של המנהל המחובר
+// ==========================================
+app.get('/api/cafeteria/students/lookup', requireCafeteria, async (req, res) => {
+    const phone = normalizePhone(req.query.phone || '');
+    if (!isValidPhone(phone)) {
+        return res.status(400).json({ status: 'error', message: 'Phone must be an Israeli mobile number (05XXXXXXXX)' });
+    }
+    try {
+        const result = await pool.query(
+            'SELECT name FROM students WHERE phone = $1 AND cafeteria_id = $2',
+            [phone, req.cafeteria.cafeteriaId]
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ status: 'error', message: 'No student with this phone in your cafeteria' });
+        }
+        res.status(200).json({ status: 'success', name: result.rows[0].name });
+    } catch (err) {
+        console.error('Error looking up student:', err);
+        res.status(500).json({ status: 'error', message: 'Server error while looking up student' });
+    }
+});
+
+app.post('/api/cafeteria/topup', requireCafeteria, async (req, res) => {
+    const phone = normalizePhone(req.body.phone || '');
+    const amount = Math.round(Number(req.body.amount) * 100) / 100;
+
+    if (!isValidPhone(phone)) {
+        return res.status(400).json({ status: 'error', message: 'Phone must be an Israeli mobile number (05XXXXXXXX)' });
+    }
+    if (!Number.isFinite(amount) || amount <= 0) {
+        return res.status(400).json({ status: 'error', message: 'Amount must be greater than 0' });
+    }
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const studentResult = await client.query(
+            'SELECT id, name FROM students WHERE phone = $1 AND cafeteria_id = $2 FOR UPDATE',
+            [phone, req.cafeteria.cafeteriaId]
+        );
+        if (studentResult.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ status: 'error', message: 'No student with this phone in your cafeteria' });
+        }
+        const student = studentResult.rows[0];
+
+        const updated = await client.query(
+            'UPDATE students SET balance = COALESCE(balance, 0) + $1 WHERE id = $2 RETURNING balance',
+            [amount, student.id]
+        );
+
+        await client.query(
+            `INSERT INTO balance_transactions (student_id, amount, type, description)
+             VALUES ($1, $2, 'topup', $3)`,
+            [student.id, amount, `טעינה על ידי הקפיטריה (מנהל ${req.cafeteria.cafeteriaId})`]
+        );
+
+        await client.query('COMMIT');
+        res.status(200).json({
+            status: 'success',
+            student_name: student.name,
+            added: amount,
+            newBalance: Number(updated.rows[0].balance)
+        });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('Error topping up wallet:', err);
+        res.status(500).json({ status: 'error', message: 'Server error while topping up wallet' });
+    } finally {
+        client.release();
+    }
+});
+
+// ==========================================
+// אדמין (בעל האפליקציה) - /api/admin/*
+// הסיסמה לא נשמרת בקוד ולא במסד: ב-Render מגדירים משתנה סביבה ADMIN_PASSWORD_HASH
+// (גיבוב bcrypt של הסיסמה). אם המשתנה לא מוגדר - האדמין כבוי לגמרי.
+// ==========================================
+const ADMIN_PASSWORD_HASH = process.env.ADMIN_PASSWORD_HASH || '';
+const ADMIN_TOKEN_TTL = '2h';
+if (!ADMIN_PASSWORD_HASH.startsWith('$2')) {
+    console.warn('ADMIN_PASSWORD_HASH is not set - admin panel is disabled');
+}
+
+const adminLoginLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 5,
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    message: { status: 'error', message: 'Too many login attempts. Try again in 15 minutes' }
+});
+
+function requireAdmin(req, res, next) {
+    const payload = readToken(req);
+    if (!payload || payload.role !== 'admin') {
+        return res.status(401).json({ status: 'error', message: 'Admin login required' });
+    }
+    next();
+}
+
+app.post('/api/admin/login', adminLoginLimiter, async (req, res) => {
+    if (!ADMIN_PASSWORD_HASH.startsWith('$2')) {
+        return res.status(503).json({ status: 'error', message: 'Admin is not configured' });
+    }
+    const password = req.body.password ? String(req.body.password) : '';
+    try {
+        const ok = password.length > 0 && await bcrypt.compare(password, ADMIN_PASSWORD_HASH);
+        if (!ok) {
+            return res.status(401).json({ status: 'error', message: 'Invalid login details' });
+        }
+        const token = jwt.sign({ role: 'admin' }, JWT_SECRET, { algorithm: 'HS256', expiresIn: ADMIN_TOKEN_TTL });
+        res.status(200).json({ status: 'success', token });
+    } catch (err) {
+        console.error('Error during admin login:', err);
+        res.status(500).json({ status: 'error', message: 'Server error during login' });
+    }
+});
+
+// תחילת התקופה לפי שעון ישראל (ערכים קבועים מראש - לא נכנס קלט של משתמש ל-SQL)
+const ADMIN_PERIODS = {
+    today: "o.created_at >= (date_trunc('day', NOW() AT TIME ZONE 'Asia/Jerusalem') AT TIME ZONE 'Asia/Jerusalem')",
+    '7d':  "o.created_at >= NOW() - INTERVAL '7 days'",
+    '30d': "o.created_at >= NOW() - INTERVAL '30 days'",
+    all:   "TRUE"
+};
+
+// סקירה: נתוני כל הקפיטריות לתקופה
+app.get('/api/admin/overview', requireAdmin, async (req, res) => {
+    const periodSql = ADMIN_PERIODS[req.query.period] || ADMIN_PERIODS.today;
+    try {
+        const result = await pool.query(
+            `SELECT c.id, c.name, c.email, COALESCE(c.is_open, FALSE) AS is_open, COALESCE(c.auto_schedule, FALSE) AS auto_schedule, c.schedule,
+                    (SELECT COUNT(*) FROM students s WHERE s.cafeteria_id = c.id)::int AS students,
+                    COUNT(o.id) FILTER (WHERE o.status <> 'cancelled')::int AS orders,
+                    COUNT(o.id) FILTER (WHERE o.status = 'pending')::int AS pending,
+                    COUNT(o.id) FILTER (WHERE o.status = 'cancelled')::int AS cancelled,
+                    COALESCE(SUM(o.total_price) FILTER (WHERE o.status <> 'cancelled'), 0) AS revenue,
+                    COALESCE(SUM(o.total_price) FILTER (WHERE o.status <> 'cancelled' AND o.payment_method = 'cash'), 0) AS cash_total,
+                    COALESCE(SUM(o.total_price) FILTER (WHERE o.status <> 'cancelled' AND o.payment_method IS DISTINCT FROM 'cash'), 0) AS wallet_total
+             FROM cafeterias c
+             LEFT JOIN orders o ON o.cafeteria_id = c.id AND ${periodSql}
+             GROUP BY c.id
+             ORDER BY c.name`
+        );
+        const cafeterias = result.rows.map(({ schedule, ...r }) => ({
+            ...r,
+            is_open: isCafeteriaOpenNow({ ...r, schedule }),
+            revenue: Number(r.revenue),
+            cash_total: Number(r.cash_total),
+            wallet_total: Number(r.wallet_total)
+        }));
+        const totals = cafeterias.reduce((t, c) => ({
+            orders: t.orders + c.orders,
+            pending: t.pending + c.pending,
+            revenue: t.revenue + c.revenue,
+            cash_total: t.cash_total + c.cash_total,
+            wallet_total: t.wallet_total + c.wallet_total,
+            students: t.students + c.students
+        }), { orders: 0, pending: 0, revenue: 0, cash_total: 0, wallet_total: 0, students: 0 });
+
+        res.status(200).json({ status: 'success', totals, cafeterias });
+    } catch (err) {
+        console.error('Error building admin overview:', err);
+        res.status(500).json({ status: 'error', message: 'Server error while loading overview' });
+    }
+});
+
+// הזמנות של כל הקפיטריות, עם סינון
+app.get('/api/admin/orders', requireAdmin, async (req, res) => {
+    const periodSql = ADMIN_PERIODS[req.query.period] || ADMIN_PERIODS.today;
+    const conditions = [periodSql];
+    const params = [];
+
+    const cafeteriaId = Number(req.query.cafeteriaId);
+    if (Number.isInteger(cafeteriaId) && cafeteriaId > 0) {
+        params.push(cafeteriaId);
+        conditions.push(`o.cafeteria_id = $${params.length}`);
+    }
+    if (['pending', 'ready', 'cancelled'].includes(req.query.status)) {
+        params.push(req.query.status);
+        conditions.push(`o.status = $${params.length}`);
+    }
+    if (req.query.payment === 'cash') conditions.push("o.payment_method = 'cash'");
+    if (req.query.payment === 'wallet') conditions.push("o.payment_method IS DISTINCT FROM 'cash'");
+
+    try {
+        const result = await pool.query(
+            `SELECT o.id, o.status, o.total_price, o.notes, o.payment_method, o.picked_up_at, o.created_at,
+                    c.id AS cafeteria_id, c.name AS cafeteria_name,
+                    s.name AS student_name, s.phone AS student_phone,
+                    COALESCE(
+                        json_agg(
+                            json_build_object('product_name', p.name, 'quantity', oi.quantity, 'item_notes', oi.item_notes)
+                            ORDER BY oi.id
+                        ) FILTER (WHERE oi.id IS NOT NULL),
+                        '[]'
+                    ) AS items
+             FROM orders o
+             JOIN cafeterias c ON c.id = o.cafeteria_id
+             JOIN students s ON s.id = o.student_id
+             LEFT JOIN order_items oi ON oi.order_id = o.id
+             LEFT JOIN products p ON p.id = oi.product_id
+             WHERE ${conditions.join(' AND ')}
+             GROUP BY o.id, c.id, s.id
+             ORDER BY o.created_at DESC
+             LIMIT 300`,
+            params
+        );
+        res.status(200).json({ status: 'success', count: result.rows.length, orders: result.rows });
+    } catch (err) {
+        console.error('Error fetching admin orders:', err);
+        res.status(500).json({ status: 'error', message: 'Server error while fetching orders' });
+    }
+});
+
+// יצירת קפיטריה חדשה
+app.post('/api/admin/cafeterias', requireAdmin, async (req, res) => {
+    const name = cleanText(req.body.name, 100);
+    const email = cleanText(req.body.email, 200);
+    const password = req.body.password ? String(req.body.password) : '';
+
+    if (!name || name.length < 2) {
+        return res.status(400).json({ status: 'error', message: 'Cafeteria name is required (2+ characters)' });
+    }
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        return res.status(400).json({ status: 'error', message: 'A valid email is required' });
+    }
+    if (password.length < 8) {
+        return res.status(400).json({ status: 'error', message: 'Password must be at least 8 characters' });
+    }
+
+    try {
+        const exists = await pool.query('SELECT 1 FROM cafeterias WHERE LOWER(name) = LOWER($1)', [name]);
+        if (exists.rows.length > 0) {
+            return res.status(409).json({ status: 'error', message: 'A cafeteria with this name already exists' });
+        }
+        const hashed = await bcrypt.hash(password, 12);
+        const result = await pool.query(
+            'INSERT INTO cafeterias (name, email, password) VALUES ($1, $2, $3) RETURNING id, name, email',
+            [name, email, hashed]
+        );
+        res.status(201).json({ status: 'success', cafeteria: result.rows[0] });
+    } catch (err) {
+        console.error('Error creating cafeteria:', err);
+        res.status(500).json({ status: 'error', message: 'Server error while creating cafeteria' });
+    }
+});
+
+// איפוס סיסמת מנהל של קפיטריה
+app.put('/api/admin/cafeterias/:id/password', requireAdmin, async (req, res) => {
+    const id = Number(req.params.id);
+    const password = req.body.password ? String(req.body.password) : '';
+    if (!Number.isInteger(id) || id < 1) {
+        return res.status(400).json({ status: 'error', message: 'Invalid cafeteria id' });
+    }
+    if (password.length < 8) {
+        return res.status(400).json({ status: 'error', message: 'Password must be at least 8 characters' });
+    }
+    try {
+        const hashed = await bcrypt.hash(password, 12);
+        const result = await pool.query('UPDATE cafeterias SET password = $1 WHERE id = $2 RETURNING id', [hashed, id]);
+        if (result.rows.length === 0) {
+            return res.status(404).json({ status: 'error', message: 'Cafeteria not found' });
+        }
+        res.status(200).json({ status: 'success' });
+    } catch (err) {
+        console.error('Error resetting cafeteria password:', err);
+        res.status(500).json({ status: 'error', message: 'Server error while updating password' });
     }
 });
 
@@ -741,6 +1112,117 @@ app.post('/api/products', requireCafeteria, upload.single('image'), async (req, 
 });
 
 // ==========================================
+// עריכת מוצר - מנהל מחובר בלבד, ורק מוצר של הקפיטריה שלו
+// PUT /api/products/:id  (multipart: name, price, description, categoryName, is_available, image, remove_image)
+// שדה שלא נשלח - נשאר כמו שהוא. image חדש מחליף תמונה; remove_image=true מוחק את התמונה.
+// ==========================================
+app.put('/api/products/:id', requireCafeteria, upload.single('image'), async (req, res) => {
+    const productId = Number(req.params.id);
+    const cafeteria_id = req.cafeteria.cafeteriaId;
+    if (!Number.isInteger(productId) || productId < 1) {
+        return res.status(400).json({ status: 'error', message: 'Invalid product id' });
+    }
+
+    const sets = [];
+    const params = [];
+    const add = (column, value) => { params.push(value); sets.push(`${column} = $${params.length}`); };
+
+    if (req.body.name !== undefined) {
+        const name = cleanText(req.body.name, 100);
+        if (!name) return res.status(400).json({ status: 'error', message: 'name cannot be empty' });
+        add('name', name);
+    }
+    if (req.body.price !== undefined) {
+        const price = Number(req.body.price);
+        if (!Number.isFinite(price) || price <= 0 || price > 10000) {
+            return res.status(400).json({ status: 'error', message: 'A valid price is required' });
+        }
+        add('price', Math.round(price * 100) / 100);
+    }
+    if (req.body.description !== undefined) add('description', cleanText(req.body.description, 500));
+    if (req.body.is_available !== undefined) add('is_available', req.body.is_available === 'true' || req.body.is_available === true);
+
+    try {
+        const categoryName = cleanText(req.body.categoryName, 100);
+        if (categoryName) {
+            const cat = await pool.query('SELECT id FROM categories WHERE name = $1', [categoryName]);
+            if (cat.rows.length === 0) {
+                return res.status(404).json({ status: 'error', message: `Category '${categoryName}' not found` });
+            }
+            add('category_id', cat.rows[0].id);
+        }
+
+        if (req.file) {
+            add('image_data', req.file.buffer);
+            add('image_mime', req.file.mimetype);
+        } else if (req.body.remove_image === 'true') {
+            sets.push('image_data = NULL', 'image_mime = NULL');
+        }
+
+        if (sets.length === 0) {
+            return res.status(400).json({ status: 'error', message: 'Nothing to update' });
+        }
+
+        params.push(productId, cafeteria_id);
+        const result = await pool.query(
+            `UPDATE products SET ${sets.join(', ')}
+             WHERE id = $${params.length - 1} AND cafeteria_id = $${params.length}
+             RETURNING id, cafeteria_id, name, price, description, is_available, category_id,
+                       (image_data IS NOT NULL) AS has_image`,
+            params
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ status: 'error', message: 'Product not found' });
+        }
+
+        const { has_image, ...product } = result.rows[0];
+        product.image_url = has_image ? productImageUrl(req, product.id) : null;
+        res.status(200).json({ status: 'success', message: 'Product updated', product });
+
+    } catch (err) {
+        console.error('Error updating product:', err);
+        res.status(500).json({ status: 'error', message: 'Server error while updating product' });
+    }
+});
+
+// ==========================================
+// מחיקת מוצר - מנהל מחובר בלבד, ורק מוצר של הקפיטריה שלו
+// DELETE /api/products/:id
+// מוצר שכבר הוזמן לא נמחק (כדי לא לפגוע בהיסטוריית ההזמנות) - במקרה כזה מסמנים אותו "לא זמין".
+// ==========================================
+app.delete('/api/products/:id', requireCafeteria, async (req, res) => {
+    const productId = Number(req.params.id);
+    if (!Number.isInteger(productId) || productId < 1) {
+        return res.status(400).json({ status: 'error', message: 'Invalid product id' });
+    }
+    try {
+        const own = await pool.query(
+            'SELECT 1 FROM products WHERE id = $1 AND cafeteria_id = $2',
+            [productId, req.cafeteria.cafeteriaId]
+        );
+        if (own.rows.length === 0) {
+            return res.status(404).json({ status: 'error', message: 'Product not found' });
+        }
+
+        const used = await pool.query('SELECT 1 FROM order_items WHERE product_id = $1 LIMIT 1', [productId]);
+        if (used.rows.length > 0) {
+            return res.status(409).json({
+                status: 'error',
+                message: 'Product has past orders and cannot be deleted',
+                code: 'PRODUCT_HAS_ORDERS'
+            });
+        }
+
+        await pool.query('DELETE FROM products WHERE id = $1 AND cafeteria_id = $2', [productId, req.cafeteria.cafeteriaId]);
+        res.status(200).json({ status: 'success', message: 'Product deleted' });
+
+    } catch (err) {
+        console.error('Error deleting product:', err);
+        res.status(500).json({ status: 'error', message: 'Server error while deleting product' });
+    }
+});
+
+// ==========================================
 // 4. שליפת כל המוצרים של קפיטריה מסוימת - ציבורי (התפריט)
 // ==========================================
 app.get('/api/products', async (req, res) => {
@@ -848,6 +1330,12 @@ app.post('/api/orders', requireStudent, async (req, res) => {
     const studentId = req.student.studentId;
     const cafeteriaId = req.student.cafeteriaId;
 
+    // אמצעי תשלום: wallet = מהיתרה באפליקציה, cash = מזומן באיסוף
+    const paymentMethod = req.body.paymentMethod === undefined ? 'wallet' : req.body.paymentMethod;
+    if (paymentMethod !== 'wallet' && paymentMethod !== 'cash') {
+        return res.status(400).json({ status: 'error', message: "paymentMethod must be 'wallet' or 'cash'" });
+    }
+
     if (!Array.isArray(items) || items.length === 0) {
         return res.status(400).json({
             status: 'error',
@@ -879,6 +1367,20 @@ app.post('/api/orders', requireStudent, async (req, res) => {
 
     try {
         await client.query('BEGIN');
+
+        // קפיטריה נעולה - לא מקבלים הזמנות
+        const openCheck = await client.query(
+            'SELECT COALESCE(is_open, FALSE) AS is_open, COALESCE(auto_schedule, FALSE) AS auto_schedule, schedule FROM cafeterias WHERE id = $1',
+            [cafeteriaId]
+        );
+        if (openCheck.rows.length === 0 || !isCafeteriaOpenNow(openCheck.rows[0])) {
+            await client.query('ROLLBACK');
+            return res.status(403).json({
+                status: 'error',
+                message: 'Cafeteria is closed',
+                code: 'CAFETERIA_CLOSED'
+            });
+        }
 
         // נעילת שורת התלמיד וקריאת היתרה - מונעת מצב שבו שתי הזמנות במקביל
         // עוברות את בדיקת היתרה ומורידות יותר כסף ממה שיש
@@ -935,7 +1437,7 @@ app.post('/api/orders', requireStudent, async (req, res) => {
         totalPrice = Math.round(totalPrice * 100) / 100;
 
         // בדיקת יתרה
-        if (balance < totalPrice) {
+        if (paymentMethod === 'wallet' && balance < totalPrice) {
             await client.query('ROLLBACK');
             return res.status(400).json({
                 status: 'error',
@@ -948,9 +1450,9 @@ app.post('/api/orders', requireStudent, async (req, res) => {
         // יצירת ההזמנה
         const orderResult = await client.query(
             `INSERT INTO orders (cafeteria_id, student_id, status, total_price, notes, payment_method)
-             VALUES ($1, $2, 'pending', $3, $4, 'wallet')
+             VALUES ($1, $2, 'pending', $3, $4, $5)
              RETURNING *`,
-            [cafeteriaId, studentId, totalPrice, notes]
+            [cafeteriaId, studentId, totalPrice, notes, paymentMethod]
         );
         const order = orderResult.rows[0];
 
@@ -967,18 +1469,22 @@ app.post('/api/orders', requireStudent, async (req, res) => {
             orderItems.push({ ...itemResult.rows[0], product_name: product.name });
         }
 
-        // הורדת הסכום מהארנק (עמודת balance בטבלת students)
-        const balanceUpdate = await client.query(
-            'UPDATE students SET balance = COALESCE(balance, 0) - $1 WHERE id = $2 RETURNING balance',
-            [totalPrice, studentId]
-        );
+        // הורדת הסכום מהארנק - רק בתשלום מהיתרה. במזומן לא נוגעים בארנק
+        let newBalance = balance;
+        if (paymentMethod === 'wallet') {
+            const balanceUpdate = await client.query(
+                'UPDATE students SET balance = COALESCE(balance, 0) - $1 WHERE id = $2 RETURNING balance',
+                [totalPrice, studentId]
+            );
+            newBalance = Number(balanceUpdate.rows[0].balance);
 
-        // רישום התנועה לצורך מעקב
-        await client.query(
-            `INSERT INTO balance_transactions (student_id, amount, type, description)
-             VALUES ($1, $2, 'purchase', $3)`,
-            [studentId, -totalPrice, `הזמנה מספר ${order.id}`]
-        );
+            // רישום התנועה לצורך מעקב
+            await client.query(
+                `INSERT INTO balance_transactions (student_id, amount, type, description)
+                 VALUES ($1, $2, 'purchase', $3)`,
+                [studentId, -totalPrice, `הזמנה מספר ${order.id}`]
+            );
+        }
 
         await client.query('COMMIT');
 
@@ -986,7 +1492,7 @@ app.post('/api/orders', requireStudent, async (req, res) => {
             status: 'success',
             message: 'Order placed successfully!',
             order: { ...order, items: orderItems },
-            newBalance: Number(balanceUpdate.rows[0].balance)
+            newBalance
         });
 
     } catch (err) {
@@ -1018,6 +1524,7 @@ app.get('/api/orders', requireCafeteria, async (req, res) => {
                 o.total_price,
                 o.notes,
                 o.payment_method,
+                o.picked_up_at,
                 o.created_at,
                 s.id   AS student_id,
                 s.name AS student_name,
@@ -1119,7 +1626,8 @@ app.put('/api/orders/:id/status', requireCafeteria, async (req, res) => {
 
         // בביטול - החזרת הכסף לארנק
         let refunded = 0;
-        if (status === 'cancelled') {
+        // החזר לארנק רק אם שולם מהארנק (הזמנה במזומן לא שולמה מראש)
+        if (status === 'cancelled' && order.payment_method !== 'cash') {
             refunded = Number(order.total_price);
 
             // עדכון היתרה בטבלת students
@@ -1160,6 +1668,44 @@ app.put('/api/orders/:id/status', requireCafeteria, async (req, res) => {
 });
 
 // ==========================================
+// סימון הזמנה כנאספה - מנהל קפיטריה מחובר בלבד
+// PUT /api/orders/:id/pickup
+// אפשר רק להזמנה במצב "מוכנה" שעוד לא נאספה. נשמרים התאריך והשעה של האיסוף.
+// דורש עמודה: ALTER TABLE orders ADD COLUMN IF NOT EXISTS picked_up_at TIMESTAMPTZ;
+// ==========================================
+app.put('/api/orders/:id/pickup', requireCafeteria, async (req, res) => {
+    const orderId = Number(req.params.id);
+    if (!Number.isInteger(orderId) || orderId < 1) {
+        return res.status(400).json({ status: 'error', message: 'Invalid order id' });
+    }
+    try {
+        const result = await pool.query(
+            `UPDATE orders SET picked_up_at = NOW()
+             WHERE id = $1 AND cafeteria_id = $2 AND status = 'ready' AND picked_up_at IS NULL
+             RETURNING id, picked_up_at`,
+            [orderId, req.cafeteria.cafeteriaId]
+        );
+        if (result.rows.length > 0) {
+            return res.status(200).json({ status: 'success', order: result.rows[0] });
+        }
+        const check = await pool.query(
+            'SELECT status, picked_up_at FROM orders WHERE id = $1 AND cafeteria_id = $2',
+            [orderId, req.cafeteria.cafeteriaId]
+        );
+        if (check.rows.length === 0) {
+            return res.status(404).json({ status: 'error', message: `Order ${orderId} not found` });
+        }
+        if (check.rows[0].picked_up_at) {
+            return res.status(400).json({ status: 'error', message: 'Order was already picked up', picked_up_at: check.rows[0].picked_up_at });
+        }
+        return res.status(400).json({ status: 'error', message: 'Only a ready order can be marked as picked up' });
+    } catch (err) {
+        console.error('Error marking order as picked up:', err);
+        res.status(500).json({ status: 'error', message: 'Server error while updating order' });
+    }
+});
+
+// ==========================================
 // הזמנות של התלמיד המחובר - הוסף ל-server.js לפני "נתיב שלא קיים"
 // GET /api/students/orders
 // התלמיד נקבע לפי ה-token, כך שאי אפשר לראות הזמנות של אחרים
@@ -1172,6 +1718,8 @@ app.get('/api/students/orders', requireStudent, async (req, res) => {
                 o.status,
                 o.total_price,
                 o.notes,
+                o.payment_method,
+                o.picked_up_at,
                 o.created_at,
                 COALESCE(
                     json_agg(
@@ -1198,6 +1746,89 @@ app.get('/api/students/orders', requireStudent, async (req, res) => {
     } catch (err) {
         console.error('Error fetching student orders:', err);
         res.status(500).json({ status: 'error', message: 'Server error while fetching orders' });
+    }
+});
+
+// ==========================================
+// פתיחה / נעילה של הקפיטריה
+// דורש עמודה: ALTER TABLE cafeterias ADD COLUMN IF NOT EXISTS is_open BOOLEAN NOT NULL DEFAULT FALSE;  -- ברירת מחדל: סגורה
+// GET /api/cafeteria-status - תלמיד או צוות מחוברים, מחזיר את מצב הקפיטריה שלהם
+// PUT /api/cafeteria-status - צוות בלבד, גוף הבקשה: { "is_open": true | false }
+// ==========================================
+app.get('/api/cafeteria-status', async (req, res) => {
+    const payload = readToken(req);
+    if (!payload || (payload.role !== 'student' && payload.role !== 'cafeteria')) {
+        return res.status(401).json({ status: 'error', message: 'Please log in again' });
+    }
+
+    try {
+        const result = await pool.query(
+            'SELECT COALESCE(is_open, FALSE) AS is_open, COALESCE(auto_schedule, FALSE) AS auto_schedule, schedule FROM cafeterias WHERE id = $1',
+            [payload.cafeteriaId]
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ status: 'error', message: 'Cafeteria not found' });
+        }
+        const row = result.rows[0];
+        res.status(200).json({
+            status: 'success',
+            is_open: isCafeteriaOpenNow(row),
+            auto_schedule: row.auto_schedule,
+            manual_open: row.is_open,
+            schedule: payload.role === 'cafeteria' ? row.schedule : undefined
+        });
+    } catch (err) {
+        console.error('Error fetching cafeteria status:', err);
+        res.status(500).json({ status: 'error', message: 'Server error while fetching status' });
+    }
+});
+
+app.put('/api/cafeteria-status', requireCafeteria, async (req, res) => {
+    const { is_open } = req.body;
+    if (typeof is_open !== 'boolean') {
+        return res.status(400).json({ status: 'error', message: 'is_open must be true or false' });
+    }
+
+    try {
+        const result = await pool.query(
+            'UPDATE cafeterias SET is_open = $1 WHERE id = $2 RETURNING is_open',
+            [is_open, req.cafeteria.cafeteriaId]
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ status: 'error', message: 'Cafeteria not found' });
+        }
+        res.status(200).json({ status: 'success', is_open: result.rows[0].is_open });
+    } catch (err) {
+        console.error('Error updating cafeteria status:', err);
+        res.status(500).json({ status: 'error', message: 'Server error while updating status' });
+    }
+});
+
+// הגדרת שעות פתיחה אוטומטיות - צוות בלבד
+// PUT /api/cafeteria-schedule  { auto_schedule: true|false, schedule: { "0": {enabled, open, close}, ... "6": {...} } }
+// דורש עמודות: ALTER TABLE cafeterias ADD COLUMN IF NOT EXISTS auto_schedule BOOLEAN NOT NULL DEFAULT FALSE, ADD COLUMN IF NOT EXISTS schedule JSONB;
+app.put('/api/cafeteria-schedule', requireCafeteria, async (req, res) => {
+    if (typeof req.body.auto_schedule !== 'boolean') {
+        return res.status(400).json({ status: 'error', message: 'auto_schedule must be true or false' });
+    }
+    const schedule = validateSchedule(req.body.schedule);
+    if (!schedule) {
+        return res.status(400).json({ status: 'error', message: 'Invalid schedule: each enabled day needs opening time earlier than closing time (HH:MM)' });
+    }
+    try {
+        const result = await pool.query(
+            `UPDATE cafeterias SET auto_schedule = $1, schedule = $2::jsonb WHERE id = $3
+             RETURNING COALESCE(is_open, FALSE) AS is_open, auto_schedule, schedule`,
+            [req.body.auto_schedule, JSON.stringify(schedule), req.cafeteria.cafeteriaId]
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ status: 'error', message: 'Cafeteria not found' });
+        }
+        const row = result.rows[0];
+        res.status(200).json({ status: 'success', is_open: isCafeteriaOpenNow(row), auto_schedule: row.auto_schedule, schedule: row.schedule });
+    } catch (err) {
+        console.error('Error updating cafeteria schedule:', err);
+        res.status(500).json({ status: 'error', message: 'Server error while updating schedule' });
     }
 });
 
