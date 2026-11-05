@@ -43,7 +43,9 @@
     <nav class="flex gap-1.5 bg-slate-900 p-1 rounded-xl border border-slate-800 text-sm mb-4">
         <button id="tab-overview" onclick="setTab('overview')" class="flex-1 py-2 rounded-lg font-bold">סקירה</button>
         <button id="tab-orders" onclick="setTab('orders')" class="flex-1 py-2 rounded-lg font-bold">הזמנות</button>
+        <button id="tab-topups" onclick="setTab('topups')" class="flex-1 py-2 rounded-lg font-bold">טעינות</button>
         <button id="tab-cafeterias" onclick="setTab('cafeterias')" class="flex-1 py-2 rounded-lg font-bold">קפיטריות</button>
+        <button id="tab-students" onclick="setTab('students')" class="flex-1 py-2 rounded-lg font-bold">תלמידים</button>
     </nav>
 
     <div id="period-bar" class="flex gap-1.5 mb-4 text-xs">
@@ -55,6 +57,48 @@
     </div>
 
     <main id="content"></main>
+</div>
+
+<!-- חלון אישור -->
+<div id="cf-modal" class="hidden fixed inset-0 z-40 bg-slate-950/85 backdrop-blur-md flex items-center justify-center p-4">
+    <div class="w-full max-w-sm bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-3 shadow-2xl">
+        <div class="flex items-center gap-3">
+            <div id="cf-icon" class="w-10 h-10 rounded-xl flex items-center justify-center shrink-0"></div>
+            <h3 id="cf-title" class="font-black text-base"></h3>
+        </div>
+        <p id="cf-text" class="text-sm text-slate-300 leading-relaxed"></p>
+        <div class="grid grid-cols-2 gap-2 pt-1">
+            <button onclick="cfAnswer(false)" class="border border-slate-700 hover:bg-slate-800 text-slate-200 font-bold py-2.5 rounded-xl text-sm">ביטול</button>
+            <button id="cf-ok" onclick="cfAnswer(true)" class="font-bold py-2.5 rounded-xl text-sm text-white"></button>
+        </div>
+    </div>
+</div>
+
+<!-- חלון הגדרת סיסמה -->
+<div id="pw-modal" class="hidden fixed inset-0 z-40 bg-slate-950/85 backdrop-blur-md flex items-center justify-center p-4">
+    <div class="w-full max-w-sm bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-3 shadow-2xl">
+        <div class="flex items-start justify-between gap-3">
+            <div>
+                <h3 id="pw-title" class="font-black text-base"></h3>
+                <p id="pw-sub" class="text-xs text-slate-400 mt-0.5"></p>
+            </div>
+            <button onclick="closePwModal()" aria-label="סגור" class="text-slate-400 hover:text-white"><i class="fa-solid fa-xmark"></i></button>
+        </div>
+        <div id="pw-warn" class="text-[11px] text-amber-300 bg-amber-950/40 border border-amber-700/40 rounded-lg p-2.5"></div>
+        <div class="relative">
+            <input id="pw-1" type="password" dir="ltr" autocomplete="new-password" placeholder="סיסמה חדשה" oninput="pwCheck()" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 pl-10 text-sm text-left focus:outline-none focus:border-indigo-500">
+            <button type="button" onclick="pwToggleShow()" aria-label="הצג או הסתר סיסמה" class="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300"><i id="pw-eye" class="fa-solid fa-eye"></i></button>
+        </div>
+        <input id="pw-2" type="password" dir="ltr" autocomplete="new-password" placeholder="הקלד שוב לאימות" oninput="pwCheck()" onkeydown="if(event.key==='Enter')pwSave()" class="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-sm text-left focus:outline-none focus:border-indigo-500">
+        <div class="flex items-center justify-between text-[11px]">
+            <span id="pw-hint" class="text-slate-500"></span>
+            <button type="button" onclick="pwGenerate()" class="text-indigo-300 hover:text-indigo-200 underline">צור סיסמה אקראית</button>
+        </div>
+        <div class="grid grid-cols-2 gap-2 pt-1">
+            <button onclick="closePwModal()" class="border border-slate-700 hover:bg-slate-800 text-slate-200 font-bold py-2.5 rounded-xl text-sm">ביטול</button>
+            <button id="pw-save" onclick="pwSave()" disabled class="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white font-bold py-2.5 rounded-xl text-sm">שמור סיסמה</button>
+        </div>
+    </div>
 </div>
 
 <div id="toast" class="fixed top-4 left-1/2 -translate-x-1/2 z-50 hidden px-4 py-2 rounded-xl text-sm font-bold shadow-xl"></div>
@@ -77,7 +121,7 @@
     let overview = null;
 
     const $ = (id) => document.getElementById(id);
-    const esc = (v) => { const d = document.createElement('div'); d.textContent = v == null ? '' : String(v); return d.innerHTML; };
+    const esc = (v) => v == null ? '' : String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     const money = (n) => '₪' + Number(n || 0).toLocaleString('he-IL', { minimumFractionDigits: 0, maximumFractionDigits: 2 });
 
     function toast(msg, error) {
@@ -141,10 +185,10 @@
     // ---------- ניווט ----------
     function setTab(t) {
         tab = t;
-        for (const k of ['overview', 'orders', 'cafeterias']) {
+        for (const k of ['overview', 'orders', 'topups', 'cafeterias', 'students']) {
             $('tab-' + k).className = 'flex-1 py-2 rounded-lg font-bold ' + (k === t ? 'bg-indigo-600 text-white' : 'text-slate-400');
         }
-        $('period-bar').classList.toggle('hidden', t === 'cafeterias');
+        $('period-bar').classList.toggle('hidden', t === 'cafeterias' || t === 'students');
         paintPeriod();
         refresh();
     }
@@ -162,6 +206,8 @@
         loading();
         try {
             if (tab === 'overview') { overview = await api('/admin/overview?period=' + period); renderOverview(); }
+            else if (tab === 'students') { await renderStudents(); }
+            else if (tab === 'topups') { await renderTopups(); }
             else if (tab === 'cafeterias') { overview = await api('/admin/overview?period=all'); renderCafeterias(); }
             else { await renderOrders(); }
         } catch (e) {
@@ -275,10 +321,14 @@
             <h2 class="text-sm font-bold mb-2">קפיטריות קיימות (${list.length})</h2>
             <div class="space-y-2">${list.map(c => `
                 <div class="bg-slate-900 border border-slate-800 rounded-xl p-3 flex items-center justify-between gap-2">
-                    <div class="min-w-0"><p class="font-bold text-sm truncate">${esc(c.name)}</p>
+                    <div class="min-w-0"><p class="font-bold text-sm truncate">${esc(c.name)} ${c.is_blocked ? '<span class="text-[11px] text-rose-300 bg-rose-950/60 border border-rose-700/40 rounded-full px-2 mr-1">חסומה</span>' : ''}</p>
                     <p class="text-[11px] text-slate-500 truncate" dir="ltr">${esc(c.email)}</p>
                     <p class="text-[11px] text-slate-500">${c.students} תלמידים</p></div>
-                    <button onclick="resetPassword(${c.id})" class="shrink-0 text-xs border border-slate-700 text-slate-300 hover:bg-slate-800 rounded-lg px-3 py-1.5"><i class="fa-solid fa-key ml-1"></i>איפוס סיסמה</button>
+                    <div class="shrink-0 flex flex-col gap-1.5">
+                        <button onclick="resetPassword(${c.id})" class="text-xs border border-slate-700 text-slate-300 hover:bg-slate-800 rounded-lg px-3 py-1.5"><i class="fa-solid fa-key ml-1"></i>סיסמת כניסה</button>
+                        <button onclick="toggleCafeteriaBlock(${c.id})" class="text-xs border ${c.is_blocked ? 'border-emerald-700 text-emerald-300' : 'border-rose-800 text-rose-300'} hover:bg-slate-800 rounded-lg px-3 py-1.5"><i class="fa-solid ${c.is_blocked ? 'fa-lock-open' : 'fa-ban'} ml-1"></i>${c.is_blocked ? 'שחרר קפיטריה' : 'חסום קפיטריה'}</button>
+                        <button onclick="setTopupPassword(${c.id})" class="text-xs border ${c.has_topup_password ? 'border-emerald-700 text-emerald-300' : 'border-amber-700 text-amber-300'} hover:bg-slate-800 rounded-lg px-3 py-1.5"><i class="fa-solid fa-wallet ml-1"></i>${c.has_topup_password ? 'החלף סיסמת טעינה' : 'קבע סיסמת טעינה'}</button>
+                    </div>
                 </div>`).join('')}</div>`;
     }
     function genPassword() {
@@ -294,18 +344,203 @@
         try {
             const r = await api('/admin/cafeterias', { method: 'POST', body: JSON.stringify(body) });
             toast('הקפיטריה "' + r.cafeteria.name + '" נוצרה');
-            alert('הקפיטריה נוצרה. פרטי כניסה למנהל:\n\nקפיטריה: ' + r.cafeteria.name + '\nאימייל: ' + r.cafeteria.email + '\nסיסמה: ' + body.password + '\n\nהסיסמה לא תוצג שוב.');
             refresh();
         } catch (e) { msg.textContent = he(e.message); btn.disabled = false; }
     }
-    async function resetPassword(id) {
-        const c = overview.cafeterias.find(x => x.id === id); const name = c ? c.name : '';
-        const p = genPassword();
-        if (!confirm('לאפס את הסיסמה של "' + name + '"? תיווצר סיסמה חדשה והישנה תפסיק לעבוד.')) return;
+    // ---------- טעינות ----------
+    let topupsCafeteria = '';
+    function onTopupsFilter() { topupsCafeteria = $('tp-caf').value; refresh(); }
+    async function renderTopups() {
+        if (!overview) overview = await api('/admin/overview?period=all');
+        const qs = new URLSearchParams({ period });
+        if (topupsCafeteria) qs.set('cafeteriaId', topupsCafeteria);
+        const r = await api('/admin/topups?' + qs);
+        const fmt = (d) => new Date(d).toLocaleString('he-IL', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+        $('content').innerHTML = `
+            <div class="flex flex-wrap gap-2 mb-4 items-center">
+                <select id="tp-caf" onchange="onTopupsFilter()" class="bg-slate-900 border border-slate-800 rounded-lg px-2 py-1.5 text-xs">
+                    <option value="">כל הקפיטריות</option>
+                    ${overview.cafeterias.map(c => `<option value="${c.id}" ${String(c.id) === String(topupsCafeteria) ? 'selected' : ''}>${esc(c.name)}</option>`).join('')}
+                </select>
+                <span class="text-xs text-slate-500">${r.count} טעינות${r.count > r.topups.length ? ' (מוצגות 300 אחרונות)' : ''}</span>
+            </div>
+            <div class="grid grid-cols-2 gap-3 mb-4">
+                ${statCard('fa-wallet', 'סה"כ הוטען (' + PERIOD_LABEL[period] + ')', money(r.total), 'text-emerald-400')}
+                ${statCard('fa-hashtag', 'מספר טעינות', r.count)}
+            </div>
+            ${r.topups.length === 0 ? '<p class="text-slate-500 text-sm text-center py-12">אין טעינות בתקופה הזו</p>' : `
+            <div class="grid md:grid-cols-2 gap-2">${r.topups.map(t => `
+                <div class="bg-slate-900 border border-slate-800 rounded-xl p-3 flex items-center justify-between gap-2 ${t.cancelled_at ? 'opacity-60' : ''}">
+                    <div class="min-w-0">
+                        <p class="font-bold text-sm truncate">${esc(t.student_name)}</p>
+                        <p class="text-[11px] text-slate-500"><span dir="ltr">${esc(t.student_phone)}</span> · ${fmt(t.created_at)}</p>
+                        <p class="text-[11px] text-indigo-300 truncate"><i class="fa-solid fa-store ml-1"></i>${esc(t.cafeteria_name)}</p>
+                        ${t.cancelled_at ? `<p class="text-[11px] text-rose-300">בוטלה ב-${fmt(t.cancelled_at)}</p>` : ''}
+                    </div>
+                    <span class="font-black shrink-0 ${t.cancelled_at ? 'text-slate-500 line-through' : 'text-emerald-400'}">+${money(t.amount)}</span>
+                </div>`).join('')}</div>`}`;
+    }
+
+    // ---------- חלון אישור ----------
+    let cfResolve = null;
+    function confirmModal({ title, text, okLabel, danger, icon }) {
+        $('cf-title').textContent = title;
+        $('cf-text').textContent = text;
+        $('cf-ok').textContent = okLabel;
+        $('cf-ok').className = 'font-bold py-2.5 rounded-xl text-sm text-white ' + (danger ? 'bg-rose-600 hover:bg-rose-500' : 'bg-emerald-600 hover:bg-emerald-500');
+        $('cf-icon').className = 'w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ' + (danger ? 'bg-rose-950/60 text-rose-300' : 'bg-emerald-950/60 text-emerald-300');
+        $('cf-icon').innerHTML = '<i class="fa-solid ' + (icon || (danger ? 'fa-ban' : 'fa-lock-open')) + '"></i>';
+        $('cf-modal').classList.remove('hidden');
+        return new Promise(r => { cfResolve = r; });
+    }
+    function cfAnswer(v) { $('cf-modal').classList.add('hidden'); if (cfResolve) cfResolve(v); cfResolve = null; }
+
+    // ---------- חסימה ושחרור ----------
+    async function toggleCafeteriaBlock(id) {
+        const c = overview.cafeterias.find(x => x.id === id); if (!c) return;
+        const block = !c.is_blocked;
+        const ok = await confirmModal(block
+            ? { title: 'לחסום את "' + c.name + '"?', text: 'מנהל הקפיטריה לא יוכל להיכנס, התלמידים שלה לא יוכלו להזמין, והיא לא תופיע ברשימת ההרשמה. אפשר לשחרר בכל עת.', okLabel: 'חסום קפיטריה', danger: true }
+            : { title: 'לשחרר את "' + c.name + '"?', text: 'הקפיטריה תחזור לפעול כרגיל: המנהל יוכל להיכנס והתלמידים יוכלו להזמין.', okLabel: 'שחרר', danger: false });
+        if (!ok) return;
         try {
-            await api('/admin/cafeterias/' + id + '/password', { method: 'PUT', body: JSON.stringify({ password: p }) });
-            alert('הסיסמה החדשה של "' + name + '":\n\n' + p + '\n\nהיא לא תוצג שוב.');
+            await api('/admin/cafeterias/' + id + '/blocked', { method: 'PUT', body: JSON.stringify({ blocked: block }) });
+            toast(block ? 'הקפיטריה נחסמה' : 'הקפיטריה שוחררה');
+            refresh();
         } catch (e) { toast(he(e.message), true); }
+    }
+
+    // ---------- תלמידים ----------
+    let studentsQuery = '', studentsTimer = null, studentsCache = [];
+    async function renderStudents() {
+        const r = await api('/admin/students' + (studentsQuery ? '?q=' + encodeURIComponent(studentsQuery) : ''));
+        studentsCache = r.students;
+        $('content').innerHTML = `
+            <input id="st-search" value="${esc(studentsQuery)}" oninput="onStudentSearch()" placeholder="חיפוש לפי שם, טלפון או קפיטריה" class="w-full bg-slate-900 border border-slate-800 rounded-xl p-2.5 text-sm mb-3 focus:outline-none focus:border-indigo-500">
+            <p class="text-xs text-slate-500 mb-3">${r.count} תלמידים${r.count >= 200 ? ' (מוצגים 200, צמצם עם חיפוש)' : ''}</p>
+            <div class="grid md:grid-cols-2 gap-2">${r.students.length === 0 ? '<p class="text-slate-500 text-sm text-center py-10 md:col-span-2">לא נמצאו תלמידים</p>' : r.students.map(st => `
+                <div class="bg-slate-900 border ${st.is_blocked ? 'border-rose-800/60' : 'border-slate-800'} rounded-xl p-3 flex items-center justify-between gap-2">
+                    <div class="min-w-0">
+                        <p class="font-bold text-sm truncate">${esc(st.name)} ${st.is_blocked ? '<span class="text-[11px] text-rose-300 bg-rose-950/60 border border-rose-700/40 rounded-full px-2 mr-1">חסום</span>' : ''}</p>
+                        <p class="text-[11px] text-slate-500" dir="ltr" style="text-align:right">${esc(st.phone)}</p>
+                        <p class="text-[11px] text-indigo-300 truncate"><i class="fa-solid fa-store ml-1"></i>${esc(st.cafeteria_name)} · יתרה ${money(st.balance)}</p>
+                    </div>
+                    <div class="shrink-0 flex flex-col gap-1.5">
+                        <button onclick="toggleStudentBlock(${st.id})" class="text-xs border ${st.is_blocked ? 'border-emerald-700 text-emerald-300' : 'border-rose-800 text-rose-300'} hover:bg-slate-800 rounded-lg px-3 py-1.5">${st.is_blocked ? 'שחרר' : 'חסום'}</button>
+                        <button onclick="deleteStudent(${st.id})" class="text-xs border border-slate-700 text-slate-400 hover:text-rose-300 hover:border-rose-800 hover:bg-slate-800 rounded-lg px-3 py-1.5"><i class="fa-solid fa-trash ml-1"></i>מחק</button>
+                    </div>
+                </div>`).join('')}</div>`;
+        const el = $('st-search'); el.focus(); el.setSelectionRange(el.value.length, el.value.length);
+    }
+    async function deleteStudent(id) {
+        const st = studentsCache.find(x => x.id === id); if (!st) return;
+        const hasBalance = st.balance > 0;
+        const ok = await confirmModal({
+            title: 'למחוק את ' + st.name + '?',
+            text: 'הפרטים האישיים של התלמיד (שם וטלפון) יימחקו והוא לא יוכל להיכנס יותר. הזמנות קודמות נשארות בדוחות של הקפיטריה בלי שם.'
+                + (hasBalance ? ' שים לב: בארנק שלו יתרה של ' + money(st.balance) + ', והיא תימחק. ודא שהקפיטריה החזירה לו את הכסף.' : '')
+                + ' אי אפשר לשחזר.',
+            okLabel: 'מחק תלמיד', danger: true, icon: 'fa-trash'
+        });
+        if (!ok) return;
+        try {
+            await api('/admin/students/' + id, { method: 'DELETE', body: JSON.stringify({ force: hasBalance }) });
+            toast('התלמיד נמחק');
+            refresh();
+        } catch (e) { toast(he(e.message), true); }
+    }
+    function onStudentSearch() {
+        clearTimeout(studentsTimer);
+        studentsQuery = $('st-search').value.trim();
+        studentsTimer = setTimeout(() => refresh(), 350);
+    }
+    async function toggleStudentBlock(id) {
+        const st = studentsCache.find(x => x.id === id); if (!st) return;
+        const block = !st.is_blocked;
+        const ok = await confirmModal(block
+            ? { title: 'לחסום את ' + st.name + '?', text: 'התלמיד יתנתק ולא יוכל להיכנס או להזמין. היתרה בארנק נשמרת. אפשר לשחרר בכל עת.', okLabel: 'חסום תלמיד', danger: true }
+            : { title: 'לשחרר את ' + st.name + '?', text: 'התלמיד יוכל להיכנס ולהזמין שוב.', okLabel: 'שחרר', danger: false });
+        if (!ok) return;
+        try {
+            await api('/admin/students/' + id + '/blocked', { method: 'PUT', body: JSON.stringify({ blocked: block }) });
+            toast(block ? 'התלמיד נחסם' : 'התלמיד שוחרר');
+            refresh();
+        } catch (e) { toast(he(e.message), true); }
+    }
+
+    // ---------- חלון הגדרת סיסמה (במקום חלוני הדפדפן) ----------
+    let pwCfg = null;
+    function openPwModal(cfg) {
+        pwCfg = cfg;
+        $('pw-title').textContent = cfg.title;
+        $('pw-sub').textContent = cfg.sub;
+        $('pw-warn').innerHTML = cfg.warn;
+        $('pw-1').value = ''; $('pw-2').value = '';
+        $('pw-1').type = 'password'; $('pw-2').type = 'password';
+        $('pw-eye').className = 'fa-solid fa-eye';
+        $('pw-modal').classList.remove('hidden');
+        pwCheck();
+        setTimeout(() => $('pw-1').focus(), 50);
+    }
+    function closePwModal() { $('pw-modal').classList.add('hidden'); pwCfg = null; $('pw-1').value = ''; $('pw-2').value = ''; }
+    function pwToggleShow() {
+        const show = $('pw-1').type === 'password';
+        $('pw-1').type = show ? 'text' : 'password';
+        $('pw-2').type = show ? 'text' : 'password';
+        $('pw-eye').className = 'fa-solid ' + (show ? 'fa-eye-slash' : 'fa-eye');
+    }
+    function pwGenerate() {
+        const p = genPassword();
+        $('pw-1').value = p; $('pw-2').value = p;
+        $('pw-1').type = 'text'; $('pw-2').type = 'text';
+        $('pw-eye').className = 'fa-solid fa-eye-slash';
+        pwCheck();
+    }
+    function pwCheck() {
+        if (!pwCfg) return;
+        const a = $('pw-1').value, b = $('pw-2').value;
+        const hint = $('pw-hint'), btn = $('pw-save');
+        let ok = false;
+        if (a.length === 0) { hint.className = 'text-slate-500'; hint.textContent = 'לפחות ' + pwCfg.min + ' תווים'; }
+        else if (a.length < pwCfg.min) { hint.className = 'text-slate-500'; hint.textContent = 'עוד ' + (pwCfg.min - a.length) + ' תווים'; }
+        else if (b.length === 0) { hint.className = 'text-slate-500'; hint.textContent = 'הקלד שוב לאימות'; }
+        else if (a !== b) { hint.className = 'text-rose-400'; hint.textContent = 'הסיסמאות לא זהות'; }
+        else { hint.className = 'text-emerald-400'; hint.textContent = 'מוכן לשמירה'; ok = true; }
+        btn.disabled = !ok;
+    }
+    async function pwSave() {
+        if (!pwCfg || $('pw-save').disabled) return;
+        const btn = $('pw-save'), cfg = pwCfg, pw = $('pw-1').value;
+        btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+        try {
+            await api(cfg.path, { method: 'PUT', body: JSON.stringify({ password: pw }) });
+            closePwModal();
+            toast(cfg.success);
+            if (cfg.after) cfg.after();
+        } catch (e) {
+            $('pw-hint').className = 'text-rose-400'; $('pw-hint').textContent = he(e.message);
+        }
+        btn.textContent = 'שמור סיסמה'; pwCheck();
+    }
+    function cafName(id) { const c = overview.cafeterias.find(x => x.id === id); return c ? c.name : ''; }
+    function resetPassword(id) {
+        const name = cafName(id);
+        openPwModal({
+            title: 'סיסמת כניסה למנהל הקפיטריה', sub: name, min: 8,
+            warn: '<i class="fa-solid fa-triangle-exclamation ml-1"></i>הסיסמה הנוכחית של המנהל תפסיק לעבוד מיד. מסור את הסיסמה החדשה לבעלים של הקפיטריה.',
+            path: '/admin/cafeterias/' + id + '/password',
+            success: 'סיסמת הכניסה של "' + name + '" עודכנה'
+        });
+    }
+    function setTopupPassword(id) {
+        const name = cafName(id);
+        openPwModal({
+            title: 'סיסמת טעינת ארנק', sub: name, min: 6,
+            warn: '<i class="fa-solid fa-circle-info ml-1"></i>הסיסמה הזו נדרשת בכל טעינת ארנק. מסור אותה רק לבעלים של הקפיטריה.',
+            path: '/admin/cafeterias/' + id + '/topup-password',
+            success: 'סיסמת הטעינה של "' + name + '" נקבעה',
+            after: refresh
+        });
     }
 
     if (token) showAdmin();

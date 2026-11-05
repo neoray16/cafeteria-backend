@@ -240,7 +240,7 @@ function israelNow() {
 }
 
 function isCafeteriaOpenNow(row) {
-    if (!row) return false;
+    if (!row || row.is_blocked) return false;
     if (!row.auto_schedule) return !!row.is_open;
     const schedule = row.schedule || {};
     const { day, time } = israelNow();
@@ -280,21 +280,46 @@ function readToken(req) {
     }
 }
 
+// חסימה: תלמיד או קפיטריה שנחסמו על ידי האדמין מאבדים גישה מיד (גם עם token תקף).
+// דורש עמודות: ALTER TABLE students ADD COLUMN IF NOT EXISTS is_blocked BOOLEAN NOT NULL DEFAULT FALSE;
+//              ALTER TABLE cafeterias ADD COLUMN IF NOT EXISTS is_blocked BOOLEAN NOT NULL DEFAULT FALSE;
+const blockedResponse = (res) => res.status(403).json({
+    status: 'error',
+    message: 'This account has been blocked',
+    code: 'ACCOUNT_BLOCKED'
+});
+
 // נתיבים של תלמיד מחובר
-function requireStudent(req, res, next) {
+async function requireStudent(req, res, next) {
     const payload = readToken(req);
     if (!payload || payload.role !== 'student') {
         return res.status(401).json({ status: 'error', message: 'Please log in again' });
+    }
+    try {
+        const r = await pool.query('SELECT COALESCE(is_blocked, FALSE) AS is_blocked FROM students WHERE id = $1', [payload.studentId]);
+        if (r.rows.length === 0) return res.status(401).json({ status: 'error', message: 'Please log in again' });
+        if (r.rows[0].is_blocked) return blockedResponse(res);
+    } catch (err) {
+        console.error('Error checking student block status:', err);
+        return res.status(500).json({ status: 'error', message: 'Server error' });
     }
     req.student = payload;
     next();
 }
 
 // נתיבים של מנהל קפיטריה מחובר
-function requireCafeteria(req, res, next) {
+async function requireCafeteria(req, res, next) {
     const payload = readToken(req);
     if (!payload || payload.role !== 'cafeteria') {
         return res.status(401).json({ status: 'error', message: 'Manager login required' });
+    }
+    try {
+        const r = await pool.query('SELECT COALESCE(is_blocked, FALSE) AS is_blocked FROM cafeterias WHERE id = $1', [payload.cafeteriaId]);
+        if (r.rows.length === 0) return res.status(401).json({ status: 'error', message: 'Manager login required' });
+        if (r.rows[0].is_blocked) return blockedResponse(res);
+    } catch (err) {
+        console.error('Error checking cafeteria block status:', err);
+        return res.status(500).json({ status: 'error', message: 'Server error' });
     }
     req.cafeteria = payload;
     next();
@@ -420,7 +445,7 @@ app.post('/api/students/login/request-code', authLimiter, async (req, res) => {
     try {
         // חיפוש התלמיד לפי טלפון + שם (מתעלם מרווחים/מקפים בטלפון השמור)
         const studentResult = await pool.query(
-            `SELECT id, name, phone
+            `SELECT id, name, phone, COALESCE(is_blocked, FALSE) AS is_blocked
              FROM students
              WHERE regexp_replace(phone, '\\D', '', 'g') = $1
                AND LOWER(TRIM(name)) = LOWER($2)
@@ -437,6 +462,7 @@ app.post('/api/students/login/request-code', authLimiter, async (req, res) => {
         }
 
         const student = studentResult.rows[0];
+        if (student.is_blocked) return blockedResponse(res);
 
         // הגבלת קצב שליחה - מונע הצפת SMS (ועלויות)
         const recentResult = await pool.query(
@@ -524,7 +550,7 @@ app.post('/api/students/login/verify-code', authLimiter, async (req, res) => {
         // הקוד הפעיל האחרון של תלמיד עם מספר הטלפון הזה
         const otpResult = await pool.query(
             `SELECT o.id, o.code_hash, o.attempts, o.expires_at,
-                    s.id AS student_id, s.name, s.phone, s.cafeteria_id, s.balance
+                    s.id AS student_id, s.name, s.phone, s.cafeteria_id, s.balance, COALESCE(s.is_blocked, FALSE) AS is_blocked
              FROM otp_codes o
              JOIN students s ON s.id = o.student_id
              WHERE regexp_replace(s.phone, '\\D', '', 'g') = $1
@@ -542,6 +568,7 @@ app.post('/api/students/login/verify-code', authLimiter, async (req, res) => {
         }
 
         const otp = otpResult.rows[0];
+        if (otp.is_blocked) return blockedResponse(res);
 
         if (new Date(otp.expires_at) < new Date()) {
             await pool.query('UPDATE otp_codes SET used = TRUE WHERE id = $1', [otp.id]);
@@ -660,20 +687,56 @@ app.get('/api/cafeteria/students/lookup', requireCafeteria, async (req, res) => 
     }
     try {
         const result = await pool.query(
-            'SELECT name FROM students WHERE phone = $1 AND cafeteria_id = $2',
+            'SELECT name, COALESCE(balance, 0) AS balance FROM students WHERE phone = $1 AND cafeteria_id = $2',
             [phone, req.cafeteria.cafeteriaId]
         );
         if (result.rows.length === 0) {
             return res.status(404).json({ status: 'error', message: 'No student with this phone in your cafeteria' });
         }
-        res.status(200).json({ status: 'success', name: result.rows[0].name });
+        res.status(200).json({ status: 'success', name: result.rows[0].name, balance: Number(result.rows[0].balance) });
     } catch (err) {
         console.error('Error looking up student:', err);
         res.status(500).json({ status: 'error', message: 'Server error while looking up student' });
     }
 });
 
-app.post('/api/cafeteria/topup', requireCafeteria, async (req, res) => {
+// סיסמת טעינה: נשמרת מוצפנת בעמודה cafeterias.topup_password, ונקבעת רק דרך האדמין.
+// דורש עמודה: ALTER TABLE cafeterias ADD COLUMN IF NOT EXISTS topup_password TEXT;
+const topupLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 10,
+    skipSuccessfulRequests: true,
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    message: { status: 'error', message: 'Too many wrong attempts. Try again in 15 minutes' }
+});
+
+// בודק את סיסמת הטעינה של הקפיטריה המחוברת. אם היא חסרה או שגויה - שולח תשובה ומחזיר false.
+async function checkTopupPassword(req, res) {
+    const topupPassword = req.body && req.body.topupPassword ? String(req.body.topupPassword) : '';
+    try {
+        const pw = await pool.query('SELECT topup_password FROM cafeterias WHERE id = $1', [req.cafeteria.cafeteriaId]);
+        const hash = pw.rows[0] && pw.rows[0].topup_password;
+        if (!hash) {
+            res.status(403).json({ status: 'error', message: 'Top-up password is not set', code: 'TOPUP_PASSWORD_NOT_SET' });
+            return false;
+        }
+        if (!topupPassword || !(await bcrypt.compare(topupPassword, hash))) {
+            res.status(403).json({ status: 'error', message: 'Wrong top-up password', code: 'WRONG_TOPUP_PASSWORD' });
+            return false;
+        }
+        return true;
+    } catch (err) {
+        console.error('Error checking top-up password:', err);
+        res.status(500).json({ status: 'error', message: 'Server error while checking top-up password' });
+        return false;
+    }
+}
+
+// תקרה לטעינה בודדת (בשקלים)
+const MAX_TOPUP_AMOUNT = 360;
+
+app.post('/api/cafeteria/topup', requireCafeteria, topupLimiter, async (req, res) => {
     const phone = normalizePhone(req.body.phone || '');
     const amount = Math.round(Number(req.body.amount) * 100) / 100;
 
@@ -683,6 +746,12 @@ app.post('/api/cafeteria/topup', requireCafeteria, async (req, res) => {
     if (!Number.isFinite(amount) || amount <= 0) {
         return res.status(400).json({ status: 'error', message: 'Amount must be greater than 0' });
     }
+    if (amount > MAX_TOPUP_AMOUNT) {
+        return res.status(400).json({ status: 'error', message: `Amount cannot exceed ${MAX_TOPUP_AMOUNT}`, code: 'TOPUP_TOO_LARGE' });
+    }
+
+    // בדיקת סיסמת הטעינה לפני כל שינוי ביתרה (403 ולא 401, כדי שהאפליקציה לא תתנתק)
+    if (!(await checkTopupPassword(req, res))) return;
 
     const client = await pool.connect();
     try {
@@ -783,7 +852,7 @@ app.get('/api/admin/overview', requireAdmin, async (req, res) => {
     const periodSql = ADMIN_PERIODS[req.query.period] || ADMIN_PERIODS.today;
     try {
         const result = await pool.query(
-            `SELECT c.id, c.name, c.email, COALESCE(c.is_open, FALSE) AS is_open, COALESCE(c.auto_schedule, FALSE) AS auto_schedule, c.schedule,
+            `SELECT c.id, c.name, c.email, COALESCE(c.is_open, FALSE) AS is_open, COALESCE(c.is_blocked, FALSE) AS is_blocked, COALESCE(c.auto_schedule, FALSE) AS auto_schedule, c.schedule, (c.topup_password IS NOT NULL) AS has_topup_password,
                     (SELECT COUNT(*) FROM students s WHERE s.cafeteria_id = c.id)::int AS students,
                     COUNT(o.id) FILTER (WHERE o.status <> 'cancelled')::int AS orders,
                     COUNT(o.id) FILTER (WHERE o.status = 'pending')::int AS pending,
@@ -900,6 +969,309 @@ app.post('/api/admin/cafeterias', requireAdmin, async (req, res) => {
     }
 });
 
+// איפוס ארנק של תלמיד לפי טלפון - מנהל קפיטריה, עם סיסמת הטעינה.
+// היתרה הופכת ל-0, והפעולה נרשמת בטבלת התנועות (סוג wallet_reset, הסכום שנמחק). רק לתלמיד של הקפיטריה.
+app.post('/api/cafeteria/wallet-reset', requireCafeteria, topupLimiter, async (req, res) => {
+    const phone = normalizePhone(req.body.phone || '');
+    if (!isValidPhone(phone)) {
+        return res.status(400).json({ status: 'error', message: 'Phone must be an Israeli mobile number (05XXXXXXXX)' });
+    }
+    if (!(await checkTopupPassword(req, res))) return;
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const st = await client.query(
+            'SELECT id, name, COALESCE(balance, 0) AS balance FROM students WHERE phone = $1 AND cafeteria_id = $2 FOR UPDATE',
+            [phone, req.cafeteria.cafeteriaId]
+        );
+        if (st.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ status: 'error', message: 'No student with this phone in your cafeteria' });
+        }
+        const student = st.rows[0];
+        const removed = Number(student.balance);
+        if (removed === 0) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ status: 'error', message: 'Wallet balance is already zero', code: 'ALREADY_ZERO' });
+        }
+
+        await client.query('UPDATE students SET balance = 0 WHERE id = $1', [student.id]);
+        await client.query(
+            `INSERT INTO balance_transactions (student_id, amount, type, description)
+             VALUES ($1, $2, 'wallet_reset', $3)`,
+            [student.id, -removed, 'איפוס ארנק על ידי הקפיטריה']
+        );
+
+        await client.query('COMMIT');
+        res.status(200).json({ status: 'success', student_name: student.name, removed });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('Error resetting wallet:', err);
+        res.status(500).json({ status: 'error', message: 'Server error while resetting wallet' });
+    } finally {
+        client.release();
+    }
+});
+
+// ביטול טעינה - מנהל קפיטריה, עם סיסמת הטעינה.
+// הסכום יורד מהארנק של התלמיד, והטעינה מסומנת כמבוטלת (נשארת בהיסטוריה). אם התלמיד כבר השתמש בכסף
+// (היתרה נמוכה מסכום הטעינה) אי אפשר לבטל, כדי לא להגיע ליתרה שלילית.
+// דורש עמודות: ALTER TABLE balance_transactions ADD COLUMN IF NOT EXISTS id SERIAL, ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ;
+app.post('/api/cafeteria/topup/:id/cancel', requireCafeteria, topupLimiter, async (req, res) => {
+    const topupId = Number(req.params.id);
+    if (!Number.isInteger(topupId) || topupId < 1) {
+        return res.status(400).json({ status: 'error', message: 'Invalid top-up id' });
+    }
+    if (!(await checkTopupPassword(req, res))) return;
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const t = await client.query(
+            `SELECT bt.id, bt.amount, bt.student_id, bt.cancelled_at
+             FROM balance_transactions bt
+             JOIN students s ON s.id = bt.student_id
+             WHERE bt.id = $1 AND bt.type = 'topup' AND s.cafeteria_id = $2
+             FOR UPDATE OF bt`,
+            [topupId, req.cafeteria.cafeteriaId]
+        );
+        if (t.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ status: 'error', message: 'Top-up not found' });
+        }
+        const topup = t.rows[0];
+        if (topup.cancelled_at) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ status: 'error', message: 'Top-up was already cancelled', code: 'ALREADY_CANCELLED' });
+        }
+
+        const amount = Number(topup.amount);
+        const st = await client.query('SELECT COALESCE(balance, 0) AS balance FROM students WHERE id = $1 FOR UPDATE', [topup.student_id]);
+        const balance = Number(st.rows[0].balance);
+        if (balance < amount) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({
+                status: 'error',
+                message: 'Student balance is lower than the top-up amount',
+                code: 'BALANCE_TOO_LOW',
+                balance
+            });
+        }
+
+        const updated = await client.query(
+            'UPDATE students SET balance = COALESCE(balance, 0) - $1 WHERE id = $2 RETURNING balance',
+            [amount, topup.student_id]
+        );
+        await client.query('UPDATE balance_transactions SET cancelled_at = NOW() WHERE id = $1', [topup.id]);
+        await client.query(
+            `INSERT INTO balance_transactions (student_id, amount, type, description)
+             VALUES ($1, $2, 'topup_cancel', $3)`,
+            [topup.student_id, -amount, `ביטול טעינה מספר ${topup.id}`]
+        );
+
+        await client.query('COMMIT');
+        res.status(200).json({ status: 'success', removed: amount, newBalance: Number(updated.rows[0].balance) });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('Error cancelling top-up:', err);
+        res.status(500).json({ status: 'error', message: 'Server error while cancelling top-up' });
+    } finally {
+        client.release();
+    }
+});
+
+// ==========================================
+// היסטוריית טעינות ארנק
+// GET /api/topups?period=today|7d|30d|all  - מנהל קפיטריה: הטעינות של התלמידים שלו
+// GET /api/admin/topups?period=...&cafeteriaId=  - אדמין: כל הטעינות (אפשר לסנן לפי קפיטריה)
+// דורש עמודת זמן: ALTER TABLE balance_transactions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+// ==========================================
+async function queryTopups(period, cafeteriaId) {
+    const periodSql = (ADMIN_PERIODS[period] || ADMIN_PERIODS['30d']).replace(/o\.created_at/g, 'bt.created_at');
+    const params = [];
+    let cafSql = '';
+    if (cafeteriaId) { params.push(cafeteriaId); cafSql = ` AND c.id = $${params.length}`; }
+    const from = `FROM balance_transactions bt
+                  JOIN students s ON s.id = bt.student_id
+                  JOIN cafeterias c ON c.id = s.cafeteria_id
+                  WHERE bt.type = 'topup' AND ${periodSql}${cafSql}`;
+    const rows = await pool.query(
+        `SELECT bt.id, bt.amount, bt.created_at, bt.cancelled_at, s.name AS student_name, s.phone AS student_phone,
+                c.id AS cafeteria_id, c.name AS cafeteria_name
+         ${from} ORDER BY bt.created_at DESC LIMIT 300`, params);
+    const sum = await pool.query(`SELECT COALESCE(SUM(bt.amount) FILTER (WHERE bt.cancelled_at IS NULL), 0) AS total,
+                COUNT(*) FILTER (WHERE bt.cancelled_at IS NULL)::int AS count ${from}`, params);
+    return {
+        topups: rows.rows.map(r => ({ ...r, amount: Number(r.amount) })),
+        total: Number(sum.rows[0].total),
+        count: sum.rows[0].count
+    };
+}
+
+app.get('/api/topups', requireCafeteria, async (req, res) => {
+    try {
+        const r = await queryTopups(req.query.period, req.cafeteria.cafeteriaId);
+        res.status(200).json({ status: 'success', ...r });
+    } catch (err) {
+        console.error('Error fetching top-ups:', err);
+        res.status(500).json({ status: 'error', message: 'Server error while fetching top-ups' });
+    }
+});
+
+app.get('/api/admin/topups', requireAdmin, async (req, res) => {
+    const cafeteriaId = Number(req.query.cafeteriaId);
+    try {
+        const r = await queryTopups(req.query.period, Number.isInteger(cafeteriaId) && cafeteriaId > 0 ? cafeteriaId : null);
+        res.status(200).json({ status: 'success', ...r });
+    } catch (err) {
+        console.error('Error fetching admin top-ups:', err);
+        res.status(500).json({ status: 'error', message: 'Server error while fetching top-ups' });
+    }
+});
+
+// חסימה / שחרור של קפיטריה. קפיטריה חסומה: המנהל לא יכול להיכנס, היא לא מופיעה בהרשמה, והתלמידים שלה לא יכולים להזמין.
+app.put('/api/admin/cafeterias/:id/blocked', requireAdmin, async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id < 1 || typeof req.body.blocked !== 'boolean') {
+        return res.status(400).json({ status: 'error', message: 'Invalid request' });
+    }
+    try {
+        const result = await pool.query('UPDATE cafeterias SET is_blocked = $1 WHERE id = $2 RETURNING id, is_blocked', [req.body.blocked, id]);
+        if (result.rows.length === 0) return res.status(404).json({ status: 'error', message: 'Cafeteria not found' });
+        res.status(200).json({ status: 'success', is_blocked: result.rows[0].is_blocked });
+    } catch (err) {
+        console.error('Error blocking cafeteria:', err);
+        res.status(500).json({ status: 'error', message: 'Server error while updating cafeteria' });
+    }
+});
+
+// רשימת תלמידים (עם חיפוש לפי שם, טלפון או קפיטריה)
+app.get('/api/admin/students', requireAdmin, async (req, res) => {
+    const q = cleanText(req.query.q, 50);
+    const params = [];
+    let where = "WHERE s.phone NOT LIKE 'deleted-%'";
+    if (q) {
+        params.push('%' + q.replace(/[%_\\]/g, '\\$&') + '%');
+        where += ' AND (s.name ILIKE $1 OR s.phone LIKE $1 OR c.name ILIKE $1)';
+    }
+    try {
+        const result = await pool.query(
+            `SELECT s.id, s.name, s.phone, COALESCE(s.balance, 0) AS balance, COALESCE(s.is_blocked, FALSE) AS is_blocked,
+                    c.id AS cafeteria_id, c.name AS cafeteria_name
+             FROM students s JOIN cafeterias c ON c.id = s.cafeteria_id
+             ${where}
+             ORDER BY COALESCE(s.is_blocked, FALSE) DESC, s.id DESC
+             LIMIT 200`,
+            params
+        );
+        res.status(200).json({ status: 'success', count: result.rows.length, students: result.rows.map(r => ({ ...r, balance: Number(r.balance) })) });
+    } catch (err) {
+        console.error('Error listing students:', err);
+        res.status(500).json({ status: 'error', message: 'Server error while loading students' });
+    }
+});
+
+// חסימה / שחרור של תלמיד. תלמיד חסום מאבד גישה מיד, גם אם הוא מחובר.
+app.put('/api/admin/students/:id/blocked', requireAdmin, async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id < 1 || typeof req.body.blocked !== 'boolean') {
+        return res.status(400).json({ status: 'error', message: 'Invalid request' });
+    }
+    try {
+        const result = await pool.query('UPDATE students SET is_blocked = $1 WHERE id = $2 RETURNING id, is_blocked', [req.body.blocked, id]);
+        if (result.rows.length === 0) return res.status(404).json({ status: 'error', message: 'Student not found' });
+        res.status(200).json({ status: 'success', is_blocked: result.rows[0].is_blocked });
+    } catch (err) {
+        console.error('Error blocking student:', err);
+        res.status(500).json({ status: 'error', message: 'Server error while updating student' });
+    }
+});
+
+// מחיקת תלמיד.
+// תלמיד שאין לו היסטוריה (הזמנות או תנועות ארנק) נמחק לגמרי.
+// תלמיד עם היסטוריה לא נמחק פיזית, כדי לא לפגוע בהזמנות ובדוחות של הקפיטריה: הפרטים האישיים שלו (שם, טלפון)
+// מוסרים, הוא נחסם, ורק רישומי העסקאות נשארים (כנדרש לשמירת רישומים).
+// אם נשארה יתרה בארנק, צריך לאשר במפורש (force) שהיא נמחקת - הקפיטריה אחראית להחזר.
+app.delete('/api/admin/students/:id', requireAdmin, async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id < 1) {
+        return res.status(400).json({ status: 'error', message: 'Invalid student id' });
+    }
+    const force = req.body && req.body.force === true;
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const st = await client.query('SELECT id, COALESCE(balance, 0) AS balance FROM students WHERE id = $1 FOR UPDATE', [id]);
+        if (st.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ status: 'error', message: 'Student not found' });
+        }
+        const balance = Number(st.rows[0].balance);
+        if (balance > 0 && !force) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ status: 'error', message: 'Student has a balance in the wallet', code: 'BALANCE_REMAINING', balance });
+        }
+
+        const history = await client.query(
+            `SELECT (SELECT COUNT(*) FROM orders WHERE student_id = $1) AS orders,
+                    (SELECT COUNT(*) FROM balance_transactions WHERE student_id = $1) AS txs`,
+            [id]
+        );
+        const hasHistory = Number(history.rows[0].orders) > 0 || Number(history.rows[0].txs) > 0;
+
+        await client.query('DELETE FROM otp_codes WHERE student_id = $1', [id]);
+
+        let mode;
+        if (hasHistory) {
+            await client.query(
+                `UPDATE students SET name = 'משתמש שנמחק', phone = 'deleted-' || id::text, balance = 0, is_blocked = TRUE,
+                        marketing_consent = FALSE
+                 WHERE id = $1`,
+                [id]
+            );
+            mode = 'anonymized';
+        } else {
+            await client.query('DELETE FROM students WHERE id = $1', [id]);
+            mode = 'deleted';
+        }
+
+        await client.query('COMMIT');
+        res.status(200).json({ status: 'success', mode });
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('Error deleting student:', err);
+        res.status(500).json({ status: 'error', message: 'Server error while deleting student' });
+    } finally {
+        client.release();
+    }
+});
+
+// קביעת / החלפת סיסמת טעינת ארנק של קפיטריה (רק האדמין יכול)
+app.put('/api/admin/cafeterias/:id/topup-password', requireAdmin, async (req, res) => {
+    const id = Number(req.params.id);
+    const password = req.body.password ? String(req.body.password) : '';
+    if (!Number.isInteger(id) || id < 1) {
+        return res.status(400).json({ status: 'error', message: 'Invalid cafeteria id' });
+    }
+    if (password.length < 6) {
+        return res.status(400).json({ status: 'error', message: 'Top-up password must be at least 6 characters' });
+    }
+    try {
+        const hashed = await bcrypt.hash(password, 12);
+        const result = await pool.query('UPDATE cafeterias SET topup_password = $1 WHERE id = $2 RETURNING id', [hashed, id]);
+        if (result.rows.length === 0) {
+            return res.status(404).json({ status: 'error', message: 'Cafeteria not found' });
+        }
+        res.status(200).json({ status: 'success' });
+    } catch (err) {
+        console.error('Error setting top-up password:', err);
+        res.status(500).json({ status: 'error', message: 'Server error while updating top-up password' });
+    }
+});
+
 // איפוס סיסמת מנהל של קפיטריה
 app.put('/api/admin/cafeterias/:id/password', requireAdmin, async (req, res) => {
     const id = Number(req.params.id);
@@ -929,7 +1301,7 @@ app.put('/api/admin/cafeterias/:id/password', requireAdmin, async (req, res) => 
 app.get('/api/cafeterias', async (req, res) => {
     try {
         const result = await pool.query(
-            'SELECT id, name FROM cafeterias ORDER BY name'
+            'SELECT id, name FROM cafeterias WHERE NOT COALESCE(is_blocked, FALSE) ORDER BY name'
         );
 
         res.status(200).json({
@@ -971,7 +1343,7 @@ app.post('/api/cafeterias/login', managerLoginLimiter, async (req, res) => {
 
     try {
         const result = await pool.query(
-            'SELECT id, name, email, password FROM cafeterias WHERE name = $1',
+            'SELECT id, name, email, password, COALESCE(is_blocked, FALSE) AS is_blocked FROM cafeterias WHERE name = $1',
             [cafeteriaName]
         );
 
@@ -980,6 +1352,8 @@ app.post('/api/cafeterias/login', managerLoginLimiter, async (req, res) => {
         }
 
         const cafeteria = result.rows[0];
+
+        if (cafeteria.is_blocked) return blockedResponse(res);
 
         if (String(cafeteria.email).toLowerCase() !== email.toLowerCase()) {
             return invalid();
@@ -1370,7 +1744,7 @@ app.post('/api/orders', requireStudent, async (req, res) => {
 
         // קפיטריה נעולה - לא מקבלים הזמנות
         const openCheck = await client.query(
-            'SELECT COALESCE(is_open, FALSE) AS is_open, COALESCE(auto_schedule, FALSE) AS auto_schedule, schedule FROM cafeterias WHERE id = $1',
+            'SELECT COALESCE(is_open, FALSE) AS is_open, COALESCE(auto_schedule, FALSE) AS auto_schedule, schedule, COALESCE(is_blocked, FALSE) AS is_blocked FROM cafeterias WHERE id = $1',
             [cafeteriaId]
         );
         if (openCheck.rows.length === 0 || !isCafeteriaOpenNow(openCheck.rows[0])) {
@@ -1763,7 +2137,7 @@ app.get('/api/cafeteria-status', async (req, res) => {
 
     try {
         const result = await pool.query(
-            'SELECT COALESCE(is_open, FALSE) AS is_open, COALESCE(auto_schedule, FALSE) AS auto_schedule, schedule FROM cafeterias WHERE id = $1',
+            'SELECT COALESCE(is_open, FALSE) AS is_open, COALESCE(auto_schedule, FALSE) AS auto_schedule, schedule, COALESCE(is_blocked, FALSE) AS is_blocked FROM cafeterias WHERE id = $1',
             [payload.cafeteriaId]
         );
         if (result.rows.length === 0) {
@@ -1818,7 +2192,7 @@ app.put('/api/cafeteria-schedule', requireCafeteria, async (req, res) => {
     try {
         const result = await pool.query(
             `UPDATE cafeterias SET auto_schedule = $1, schedule = $2::jsonb WHERE id = $3
-             RETURNING COALESCE(is_open, FALSE) AS is_open, auto_schedule, schedule`,
+             RETURNING COALESCE(is_open, FALSE) AS is_open, auto_schedule, schedule, COALESCE(is_blocked, FALSE) AS is_blocked`,
             [req.body.auto_schedule, JSON.stringify(schedule), req.cafeteria.cafeteriaId]
         );
         if (result.rows.length === 0) {
@@ -1868,6 +2242,12 @@ app.use((err, req, res, next) => {
 
 // הפעלת השרת
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
+app.listen(PORT, (err) => {
+    // ב-Express 5 שגיאת האזנה (למשל פורט תפוס) מגיעה לכאן ולא נזרקת
+    if (err) {
+        console.error(`Cannot start server on port ${PORT}: ${err.code || err.message}`);
+        if (err.code === 'EADDRINUSE') console.error('Port is already in use - another copy of the server is probably still running. Close it and try again.');
+        process.exit(1);
+    }
     console.log(`Server is running on port ${PORT} (${IS_PRODUCTION ? 'production' : 'development'})`);
 });
